@@ -379,18 +379,23 @@ def build_survival_base(equipment_master: pd.DataFrame,
     """
     logger.info("[STEP] Building survival base table.")
 
-    # First failure per equipment
+    # Make a copy to avoid modifying the original
+    eq = equipment_master.copy()
+    
+    # First failure per equipment - update the Ilk_Ariza_Tarihi column
     if not fault_events.empty:
         first_fail = (
             fault_events
             .groupby("cbs_id")["Ariza_Baslangic_Zamani"]
             .min()
-            .rename("Ilk_Ariza_Tarihi")
+            .rename("Ilk_Ariza_Tarihi_New")
         )
-        eq = equipment_master.merge(first_fail, on="cbs_id", how="left")
-    else:
-        eq = equipment_master.copy()
-        eq["Ilk_Ariza_Tarihi"] = pd.NaT
+        # Update the existing Ilk_Ariza_Tarihi with more recent data from fault events
+        eq = eq.merge(first_fail, on="cbs_id", how="left")
+        # Use the more specific first failure date if available, otherwise keep existing
+        eq["Ilk_Ariza_Tarihi"] = eq["Ilk_Ariza_Tarihi_New"].fillna(eq["Ilk_Ariza_Tarihi"])
+        eq = eq.drop(columns=["Ilk_Ariza_Tarihi_New"])
+    # If fault_events is empty, we keep the existing Ilk_Ariza_Tarihi column as is
 
     eq["event"] = eq["Ilk_Ariza_Tarihi"].notna().astype(int)
 
