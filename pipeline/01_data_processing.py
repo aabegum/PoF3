@@ -7,7 +7,7 @@ import os
 import pandas as pd
 from datetime import datetime
 from utils.logger import get_logger
-from config.config import DATA_PATH, DATE_FORMAT
+from config.config import DATA_PATH
 import sys
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -24,6 +24,15 @@ MIN_CLASS_SAMPLES = 30                 # Rare class threshold
 # ================================================================
 #  STRICT COLUMN CONTRACT
 # ================================================================
+# Mapping Turkish column names to expected English names
+TURKISH_TO_ENGLISH_MAP = {
+    'Ekipman Sınıfı': 'equipment_class',
+    'TESIS_TARIHI': 'install_date',
+    'Sebekeye_Baglanma_Tarihi': 'install_date',
+    'ID': 'cbs_id',
+    'Equipment_Type': 'equipment_class'  # English version for healthy data
+}
+
 REQUIRED_FAULT_COLUMNS = {
     "cbs_id",
     "equipment_class",
@@ -49,6 +58,14 @@ def load_fault_data():
 
     logger.info(f"Loading fault data: {fault_path}")
     df = pd.read_excel(fault_path, engine="openpyxl")
+    
+    # Rename Turkish columns to English equivalents only if they exist
+    rename_dict = {}
+    for turk_col, eng_col in TURKISH_TO_ENGLISH_MAP.items():
+        if turk_col in df.columns:
+            rename_dict[turk_col] = eng_col
+    
+    df.rename(columns=rename_dict, inplace=True)
 
     # STRICT CHECK
     missing = REQUIRED_FAULT_COLUMNS - set(df.columns)
@@ -64,10 +81,18 @@ def load_fault_data():
 # 2. READ HEALTHY EQUIPMENT DATA STRICTLY
 # ------------------------------------------------------------
 def load_healthy_data():
-    healthy_path = os.path.join(DATA_PATH, "inputs", "healthy_merged_data.xlsx")
+    healthy_path = os.path.join(DATA_PATH, "inputs", "health_merged_data.xlsx")
 
     logger.info(f"Loading healthy data: {healthy_path}")
     df = pd.read_excel(healthy_path, engine="openpyxl")
+    
+    # Rename Turkish columns to English equivalents only if they exist
+    rename_dict = {}
+    for turk_col, eng_col in TURKISH_TO_ENGLISH_MAP.items():
+        if turk_col in df.columns:
+            rename_dict[turk_col] = eng_col
+    
+    df.rename(columns=rename_dict, inplace=True)
 
     missing = REQUIRED_HEALTHY_COLUMNS - set(df.columns)
     if missing:
