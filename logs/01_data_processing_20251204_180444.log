@@ -1,0 +1,40 @@
+2025-12-04 18:04:44 - INFO - ================================================================================
+2025-12-04 18:04:44 - INFO - 01_data_processing - PoF3 Data Processing
+2025-12-04 18:04:44 - INFO - ================================================================================
+2025-12-04 18:04:44 - INFO - Analysis date: 2025-12-04 00:00:00
+2025-12-04 18:04:44 - INFO - 
+2025-12-04 18:04:44 - INFO - [STEP] 1. Loading data
+2025-12-04 18:04:44 - INFO - [STEP] Loading fault data from: data/inputs/fault_merged_data.xlsx
+2025-12-04 18:05:58 - INFO - [OK] Loaded fault data: 10,884 rows, 173 columns
+2025-12-04 18:05:58 - INFO - [OK] Fault records with cbs_id: 8,693
+2025-12-04 18:06:00 - INFO - [INFO] Raw duration median (as given): 6869406.00
+2025-12-04 18:06:00 - INFO - [INFO] Detected millisecond-scale durations. Converting to minutes (value / 60000).
+2025-12-04 18:06:00 - INFO - [INFO] Extracted equipment types from 'Şebeke Unsuru'.
+2025-12-04 18:06:00 - INFO - [OK] Final fault data for processing: 8,693 rows.
+2025-12-04 18:06:00 - INFO - [STEP] Loading healthy equipment data from: data/inputs/health_merged_data.xlsx
+2025-12-04 18:06:02 - WARNING - [WARN] Healthy data uses 'ID' instead of 'cbs_id' – mapping 'ID' → 'cbs_id' (DEPRECATED, fix at source).
+2025-12-04 18:06:02 - INFO - [INFO] Extracted equipment types from 'Şebeke Unsuru'.
+2025-12-04 18:06:02 - INFO - [OK] Final healthy equipment records: 3,153
+2025-12-04 18:06:02 - INFO - 
+2025-12-04 18:06:02 - INFO - [STEP] 2. Building fault events table
+2025-12-04 18:06:02 - INFO - [OK] Fault events table created: 8,693 records.
+2025-12-04 18:06:02 - INFO - 
+2025-12-04 18:06:02 - INFO - [STEP] 3. Building equipment master
+2025-12-04 18:06:02 - INFO - [STEP] Building equipment master table.
+2025-12-04 18:06:06 - INFO - [OK] Equipment master initial size: 6,313
+2025-12-04 18:06:06 - INFO - [INFO] Grouping rare equipment types into 'Other': ['Jumper']
+2025-12-04 18:06:06 - INFO - [OK] Equipment master finalized: 6,313 unique equipment.
+2025-12-04 18:06:06 - INFO - 
+2025-12-04 18:06:06 - INFO - [STEP] 4. Building survival base
+2025-12-04 18:06:06 - INFO - [STEP] Building survival base table.
+2025-12-04 18:06:06 - WARNING - [WARN] Capping 3 equipment with duration > 21900 days.
+2025-12-04 18:06:06 - INFO - [OK] Survival base size: 6,313
+2025-12-04 18:06:06 - INFO - 
+2025-12-04 18:06:06 - INFO - [STEP] 5. Saving intermediate outputs
+2025-12-04 18:06:07 - INFO - [OK] Saved fault events to: data/intermediate/fault_events_clean.csv
+2025-12-04 18:06:07 - INFO - [OK] Saved healthy equipment to: data/intermediate/healthy_equipment_clean.csv
+2025-12-04 18:06:07 - INFO - [OK] Saved equipment master to: data/intermediate/equipment_master.csv
+2025-12-04 18:06:08 - INFO - [OK] Saved survival base to: data/intermediate/survival_base.csv
+2025-12-04 18:06:08 - INFO - 
+2025-12-04 18:06:08 - INFO - [SUCCESS] 01_data_processing completed successfully.
+2025-12-04 18:06:08 - INFO - ================================================================================
