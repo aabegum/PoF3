@@ -1,4 +1,27 @@
 ```
-# Data processing artifacts
-data/intermediate/
+# Logs and temp files
+*.log
+logs/
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Dependencies
+node_modules/
+.venv/
+venv/
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+
+# Build artifacts
+dist/
+build/
+target/
 ```
