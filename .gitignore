@@ -1,27 +1,45 @@
-```
 # Logs and temp files
 *.log
 logs/
 
-# Environment
+# Environment variables
 .env
 .env.local
 *.env.*
 
-# Editors
-.vscode/
-.idea/
+# Python cache & bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
-# Dependencies
-node_modules/
+# Virtual environments
 .venv/
 venv/
-__pycache__/
+
+# Jupyter notebook cache
+.ipynb_checkpoints/
+
+# Editor settings
+.vscode/
+.vscode-test/
+.idea/
+
+# Dependencies (node, etc.)
+node_modules/
+
+# Analysis/cache tooling
 .mypy_cache/
 .pytest_cache/
+.coverage
+htmlcov/
 
-# Build artifacts
-dist/
+# Python packaging artifacts
 build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# General build targets
 target/
-```
