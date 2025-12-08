@@ -43,6 +43,7 @@ pip-wheel-metadata/
 
 # General build targets
 target/
+.claude/
+# Pipeline generated data
 data/intermediate/
 data/outputs/
-.claude/

@@ -20,6 +20,9 @@ import os
 import sys
 import logging
 from datetime import datetime
+import numpy as np
+
+
 
 # Add project root to Python path for imports
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -207,6 +210,64 @@ def compute_pof(cph: CoxPHFitter, df: pd.DataFrame,
     logger.info(f"[OK] PoF computed for {len(pof_results)} horizons.")
     return pof_results
 
+# ------------------------------------------------------------------------------------
+# RANDOM SURVIVAL FOREST (RSF) MODEL
+# ------------------------------------------------------------------------------------
+from sksurv.ensemble import RandomSurvivalForest
+from sksurv.util import Surv
+
+def fit_rsf_model(df: pd.DataFrame, logger: logging.Logger) -> RandomSurvivalForest:
+    logger.info("[STEP] Fitting Random Survival Forest model.")
+
+    # Prepare data
+    train_df = df.drop(columns=["cbs_id"])
+    y = Surv.from_arrays(
+        event=train_df["event"].astype(bool),
+        time=train_df["duration_days"].astype(float),
+    )
+    X = train_df.drop(columns=["event", "duration_days"])
+
+    try:
+        rsf = RandomSurvivalForest(
+            n_estimators=400,
+            min_samples_split=20,
+            min_samples_leaf=5,
+            max_features="sqrt",
+            n_jobs=-1,
+            random_state=42,
+        )
+        rsf.fit(X, y)
+        logger.info("[OK] RSF model fitted successfully.")
+        return rsf
+
+    except Exception as e:
+        logger.exception(f"[FATAL] RSF model fitting failed: {e}")
+        raise
+
+
+def compute_rsf_pof(rsf_model, df: pd.DataFrame, horizons_months, logger):
+    logger.info("[STEP] Predicting PoF using RSF.")
+
+    cbs_ids = df["cbs_id"].copy()
+    X = df.drop(columns=["duration_days", "event", "cbs_id"])
+
+    pof_results = {}
+
+    for horizon in horizons_months:
+        horizon_days = horizon * 30
+        logger.info(f"  RSF PoF for {horizon}M ({horizon_days} days)...")
+
+        surv_fn = rsf_model.predict_survival_function(X)
+        pof_vals = np.array([1 - fn(horizon_days) for fn in surv_fn])
+
+        pof_results[horizon] = pd.Series(pof_vals, index=cbs_ids.values)
+
+        logger.info(
+            f"    Mean RSF PoF: {pof_results[horizon].mean():.3f}, "
+            f"Max: {pof_results[horizon].max():.3f}"
+        )
+
+    return pof_results
 
 # ------------------------------------------------------------------------------------
 # MAIN
@@ -283,6 +344,24 @@ def main():
         logger.info("")
         logger.info("[SUCCESS] 03_survival_models completed successfully.")
         logger.info("=" * 80)
+        # -------------------------- RSF Modeling --------------------------
+        logger.info("")
+        logger.info("[STEP] Training Random Survival Forest")
+        rsf = fit_rsf_model(df_cox, logger)
+
+        logger.info("[STEP] Predicting RSF PoF horizons")
+        rsf_pof = compute_rsf_pof(rsf, df_cox, SURVIVAL_HORIZONS_MONTHS, logger)
+
+        # Save RSF PoF outputs
+        for horizon, pof_series in rsf_pof.items():
+            output_df = pd.DataFrame({
+                "cbs_id": pof_series.index,
+                f"PoF_RSF_{horizon}M": pof_series.values
+            })
+            output_path = os.path.join(OUTPUT_DIR, f"pof_rsf_{horizon}m.csv")
+            output_df.to_csv(output_path, index=False, encoding="utf-8-sig")
+            logger.info(f"[OK] Saved {output_path}")
+
 
     except Exception as e:
         logger.exception(f"[FATAL] 03_survival_models failed: {e}")
