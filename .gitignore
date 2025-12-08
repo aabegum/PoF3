@@ -47,3 +47,5 @@ target/
 # Pipeline generated data
 data/intermediate/
 data/outputs/
+data/inputs/arsiv/
+data/inputs/

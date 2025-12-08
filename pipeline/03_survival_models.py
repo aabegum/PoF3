@@ -22,6 +22,17 @@ import logging
 from datetime import datetime
 import numpy as np
 
+sys.stdout.reconfigure(encoding='utf-8')
+
+# ML-based PoF models
+try:
+    import xgboost as xgb
+    from catboost import CatBoostClassifier
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import roc_auc_score, average_precision_score
+    HAS_ML = True
+except ImportError:
+    HAS_ML = False
 
 
 # Add project root to Python path for imports
@@ -268,6 +279,150 @@ def compute_rsf_pof(rsf_model, df: pd.DataFrame, horizons_months, logger):
         )
 
     return pof_results
+def train_ml_pof_models(df: pd.DataFrame, logger: logging.Logger) -> None:
+    """
+    ML tabanlı PoF modeli (XGBoost + CatBoost).
+
+    Hedef: event (0/1) → ekipman bugüne kadar en az bir kez arıza yapmış mı?
+    Bu model zaman ufkuna bağlı değil, 'statik PoF / arıza eğilimi' skoru üretir.
+    """
+
+    if not HAS_ML:
+        logger.warning("[WARN] XGBoost/CatBoost kütüphaneleri bulunamadı. ML PoF eğitimi atlanıyor.")
+        return
+
+    logger.info("")
+    logger.info("[STEP] Training ML-based PoF models (XGBoost + CatBoost).")
+
+    # Güvenli kopya
+    data = df.copy()
+
+    # Hedef: event (0/1)
+    if "event" not in data.columns:
+        raise ValueError("ML PoF modeli için 'event' kolonu bulunamadı.")
+
+    y = data["event"].astype(int)
+
+    # Kimlik ve saf süre kolonlarını ayır
+    id_col = "cbs_id"
+    drop_cols = {id_col, "event", "duration_days", "First_Fault_Date"}
+
+    # Sayısal / kategorik ayrımı
+    numeric_cols = [
+        c
+        for c in data.columns
+        if c not in drop_cols
+        and pd.api.types.is_numeric_dtype(data[c])
+    ]
+    cat_cols = []
+    if "Ekipman_Tipi" in data.columns:
+        cat_cols.append("Ekipman_Tipi")
+
+    logger.info(f"[INFO] Numeric features: {numeric_cols}")
+    logger.info(f"[INFO] Categorical features: {cat_cols}")
+
+    # XGBoost için: sadece sayısal + one-hot kategori
+    X_xgb = data[numeric_cols].copy()
+    if cat_cols:
+        X_dummies = pd.get_dummies(data[cat_cols], drop_first=True)
+        X_xgb = pd.concat([X_xgb, X_dummies], axis=1)
+
+    # CatBoost için: sayısal + kategorik birlikte
+    feature_cols_cat = numeric_cols + cat_cols
+    X_cat = data[feature_cols_cat].copy()
+    cat_indices = [feature_cols_cat.index(c) for c in cat_cols]
+
+    # Train / test split
+    X_xgb_train, X_xgb_test, y_train, y_test = train_test_split(
+        X_xgb, y, test_size=0.3, random_state=CONFIG["RANDOM_STATE"], stratify=y
+    )
+
+    X_cat_train, X_cat_test, _, _ = train_test_split(
+        X_cat, y, test_size=0.3, random_state=CONFIG["RANDOM_STATE"], stratify=y
+    )
+
+    # ------------------------------------------------------------------
+    # XGBoost
+    # ------------------------------------------------------------------
+    logger.info("[STEP] Fitting XGBoost PoF model.")
+    xgb_model = xgb.XGBClassifier(
+        n_estimators=200,
+        max_depth=3,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=0.0,
+        reg_lambda=1.0,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        random_state=CONFIG["RANDOM_STATE"],
+        n_jobs=CONFIG.get("N_JOBS", -1),
+    )
+
+    xgb_model.fit(X_xgb_train, y_train)
+    y_proba_test = xgb_model.predict_proba(X_xgb_test)[:, 1]
+
+    auc_xgb = roc_auc_score(y_test, y_proba_test)
+    ap_xgb = average_precision_score(y_test, y_proba_test)
+    logger.info(f"[OK] XGBoost test AUC: {auc_xgb:.3f}, AP: {ap_xgb:.3f}")
+
+    # Tüm veri için tahmin
+    xgb_proba_all = xgb_model.predict_proba(X_xgb)[:, 1]
+
+    # ------------------------------------------------------------------
+    # CatBoost
+    # ------------------------------------------------------------------
+    logger.info("[STEP] Fitting CatBoost PoF model.")
+    cat_model = CatBoostClassifier(
+        iterations=200,
+        depth=4,
+        learning_rate=0.05,
+        l2_leaf_reg=3.0,
+        loss_function="Logloss",
+        eval_metric="AUC",
+        verbose=False,
+        random_state=CONFIG["RANDOM_STATE"],
+    )
+
+    cat_model.fit(
+        X_cat_train,
+        y_train,
+        cat_features=cat_indices,
+        eval_set=(X_cat_test, y_test),
+        verbose=False,
+    )
+    y_proba_cat_test = cat_model.predict_proba(X_cat_test)[:, 1]
+
+    auc_cat = roc_auc_score(y_test, y_proba_cat_test)
+    ap_cat = average_precision_score(y_test, y_proba_cat_test)
+    logger.info(f"[OK] CatBoost test AUC: {auc_cat:.3f}, AP: {ap_cat:.3f}")
+
+    cat_proba_all = cat_model.predict_proba(X_cat)[:, 1]
+
+    # ------------------------------------------------------------------
+    # Sonuçları kaydet
+    # ------------------------------------------------------------------
+    out_dir = CONFIG["PATHS"]["OUTPUT_POF"]
+    os.makedirs(out_dir, exist_ok=True)
+
+    out_df = pd.DataFrame(
+        {
+            id_col: data[id_col],
+            "PoF_ML_XGB": xgb_proba_all,
+            "PoF_ML_CatBoost": cat_proba_all,
+        }
+    )
+
+    out_path = os.path.join(out_dir, "pof_ml_static.csv")
+    out_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    logger.info(f"[OK] ML PoF skorları kaydedildi: {out_path}")
+
+    # Modelleri de saklamak istersen:
+    models_dir = CONFIG["PATHS"].get("MODELS", "models")
+    os.makedirs(models_dir, exist_ok=True)
+    xgb_model.save_model(os.path.join(models_dir, "pof_ml_xgb.json"))
+    cat_model.save_model(os.path.join(models_dir, "pof_ml_catboost.cbm"))
+    logger.info("[OK] ML modelleri kaydedildi (XGBoost + CatBoost).")
 
 # ------------------------------------------------------------------------------------
 # MAIN
@@ -361,7 +516,8 @@ def main():
             output_path = os.path.join(OUTPUT_DIR, f"pof_rsf_{horizon}m.csv")
             output_df.to_csv(output_path, index=False, encoding="utf-8-sig")
             logger.info(f"[OK] Saved {output_path}")
-
+        # 3) ML-based PoF (XGBoost + CatBoost) — statik PoF
+        train_ml_pof_models(merged, logger)
 
     except Exception as e:
         logger.exception(f"[FATAL] 03_survival_models failed: {e}")

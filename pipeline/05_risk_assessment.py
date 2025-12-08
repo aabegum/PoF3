@@ -15,6 +15,8 @@ import pandas as pd
 
 from utils.logger import get_logger
 
+sys.stdout.reconfigure(encoding='utf-8')
+
 # --------------------------------------------------------------------
 # Paths
 # --------------------------------------------------------------------

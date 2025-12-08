@@ -26,6 +26,8 @@ if project_root not in sys.path:
 import numpy as np
 import pandas as pd
 
+sys.stdout.reconfigure(encoding='utf-8')
+
 # Import safe date parser
 from utils.date_parser import parse_date_safely
 

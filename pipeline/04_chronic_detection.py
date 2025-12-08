@@ -4,6 +4,7 @@ import os
 import sys
 from pathlib import Path
 from datetime import datetime, timedelta
+sys.stdout.reconfigure(encoding='utf-8')
 
 # Add project root to Python path for utils import
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
