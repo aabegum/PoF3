@@ -10,95 +10,92 @@ Usage:
     or
     from config.config import CONFIG  # For dictionary-style access
 """
-
 import os
 import pandas as pd
 
-
-# ============================
-# DIRECTORY STRUCTURE
-# ============================
+# ======================================================
+# Dizin Yapısı
+# ======================================================
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 DATA_DIR = os.path.join(BASE_DIR, "data")
-INPUT_DIR = os.path.join(DATA_DIR, "inputs")
-INTERMEDIATE_DIR = os.path.join(DATA_DIR, "intermediate")
-OUTPUT_DIR = os.path.join(DATA_DIR, "outputs")
+INPUT_DIR = os.path.join(DATA_DIR, "girdiler")
+INTERMEDIATE_DIR = os.path.join(DATA_DIR, "ara_ciktilar")
+OUTPUT_DIR = os.path.join(DATA_DIR, "sonuclar")
 
-VISUAL_DIR = os.path.join(BASE_DIR, "visuals")
-LOG_DIR = os.path.join(BASE_DIR, "logs")
+VISUAL_DIR = os.path.join(BASE_DIR, "gorseller")
 
-# Ensure all directories exist
-for directory in [INPUT_DIR, INTERMEDIATE_DIR, OUTPUT_DIR, VISUAL_DIR, LOG_DIR]:
-    os.makedirs(directory, exist_ok=True)
+# LOG directory (01_veri_isleme expects LOGLAR_DIR)
+LOG_DIR = os.path.join(BASE_DIR, "loglar")
+
+# Create directories
+for d in [INPUT_DIR, INTERMEDIATE_DIR, OUTPUT_DIR, VISUAL_DIR, LOG_DIR]:
+    os.makedirs(d, exist_ok=True)
 
 
-# ============================
-# ANALYSIS PARAMETERS
-# ============================
+# ======================================================
+# Analiz Parametreleri
+# ======================================================
 
-# Analysis date - can be set to a specific date or dynamic
 ANALYSIS_DATE = pd.Timestamp.today().normalize()
-# For fixed date analysis, use:
-# ANALYSIS_DATE = pd.Timestamp("2025-12-04")
-
-# Minimum number of equipment needed to keep an equipment class (rare classes → "Other")
 MIN_EQUIPMENT_PER_CLASS = 30
 
 
-# ============================
-# DATA INPUT PATHS
-# ============================
+# ======================================================
+# Veri Girdi Yolları
+# ======================================================
 
 DATA_PATHS = {
-    "fault_data": os.path.join(INPUT_DIR, "fault_merged_data.xlsx"),
-    "healthy_data": os.path.join(INPUT_DIR, "health_merged_data.xlsx"),
+    "fault_data": os.path.join(INPUT_DIR, "ariza_final.xlsx"),
+    "healthy_data": os.path.join(INPUT_DIR, "saglam_final.xlsx"),
 }
 
 
-# ============================
-# INTERMEDIATE OUTPUT PATHS
-# (Step 01 → Step 02 → Step 03)
-# ============================
+# ======================================================
+# Ara Çıktılar (Step 01 → Step 02 → Step 03)
+# ======================================================
 
 INTERMEDIATE_PATHS = {
-    # Step 01 outputs
     "fault_events_clean": os.path.join(INTERMEDIATE_DIR, "fault_events_clean.csv"),
     "healthy_equipment_clean": os.path.join(INTERMEDIATE_DIR, "healthy_equipment_clean.csv"),
     "equipment_master": os.path.join(INTERMEDIATE_DIR, "equipment_master.csv"),
     "survival_base": os.path.join(INTERMEDIATE_DIR, "survival_base.csv"),
 
-    # Step 02 outputs
-    "features_pof3": os.path.join(INTERMEDIATE_DIR, "features_pof3.csv"),
+    # Step 02 Türkçe çıktı
+    "ozellikler_pof3": os.path.join(INTERMEDIATE_DIR, "ozellikler_pof3.csv"),
 }
 
-# Convenience variable for Step 02
-FEATURE_OUTPUT_PATH = INTERMEDIATE_PATHS["features_pof3"]
+FEATURE_OUTPUT_PATH = INTERMEDIATE_PATHS["ozellikler_pof3"]
 
 
-# ============================
-# FINAL OUTPUT PATHS
-# (Customer-facing deliverables)
-# ============================
+# ======================================================
+# Nihai Çıktılar (Müşteri-facing)
+# ======================================================
 
 OUTPUT_PATHS = {
-    # Step 03: Survival analysis outputs
+    # Step 01 Turkish outputs
+    "ariza_kayitlari": os.path.join(OUTPUT_DIR, "ariza_kayitlari.csv"),
+    "ekipman_listesi": os.path.join(OUTPUT_DIR, "ekipman_listesi.csv"),
+    "sagkalim_taban": os.path.join(OUTPUT_DIR, "sagkalim_taban.csv"),
+    "saglam_ekipman_listesi": os.path.join(OUTPUT_DIR, "saglam_ekipman_listesi.csv"),
+
+    # Step 03
     "pof_cox": os.path.join(OUTPUT_DIR, "03_pof_cox_survival.csv"),
     "pof_rsf": os.path.join(OUTPUT_DIR, "03_pof_rsf.csv"),
 
-    # Step 04: Chronic failure detection
+    # Step 04
     "chronic_failures": os.path.join(OUTPUT_DIR, "04_chronic_failures.csv"),
 
-    # Step 05: Risk assessment
+    # Step 05
     "risk_scores": os.path.join(OUTPUT_DIR, "05_risk_scores.csv"),
     "risk_matrix": os.path.join(OUTPUT_DIR, "05_risk_matrix.csv"),
 }
 
 
-# ============================
-# VISUALIZATION PATHS
-# ============================
+# ======================================================
+# Görselleştirme yolları
+# ======================================================
 
 VISUAL_PATHS = {
     "survival_curves": os.path.join(VISUAL_DIR, "survival_curves_by_class.png"),
@@ -107,6 +104,8 @@ VISUAL_PATHS = {
     "feature_importance": os.path.join(VISUAL_DIR, "feature_importance.png"),
 }
 
+
+# (rest of config unchanged…)
 
 # ============================
 # SURVIVAL ANALYSIS SETTINGS
