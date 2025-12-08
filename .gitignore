@@ -51,3 +51,7 @@ data/inputs/arsiv/
 #data/inputs/
 catboost_info/
 models/
+data/ara_ciktilar/
+data/girdiler/
+data/girdiler/arsiv/
+data/sonuclar/
