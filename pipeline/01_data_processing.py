@@ -22,8 +22,16 @@ import sys
 import logging
 from datetime import datetime
 
+# Add project root to Python path for utils import
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 import numpy as np
 import pandas as pd
+
+# Import safe date parser
+from utils.date_parser import parse_date_safely
 
 # Make console UTF-8 safe on Windows
 try:
@@ -105,7 +113,7 @@ def setup_logger(step_name: str) -> logging.Logger:
 # ------------------------------------------------------------------------------------
 
 def parse_date(series: pd.Series, logger: logging.Logger, name: str) -> pd.Series:
-    s = pd.to_datetime(series, errors="coerce", dayfirst=True)
+    s = series.apply(parse_date_safely)
     missing = s.isna().sum()
     if missing > 0:
         logger.warning(f"[WARN] {name}: {missing} records could not be parsed as dates and will be dropped later.")

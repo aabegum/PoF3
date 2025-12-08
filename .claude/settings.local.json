@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(python:*)",
+      "Bash(del \"utils\\logger.py\")"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

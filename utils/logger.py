@@ -1,10 +1,50 @@
+"""
+Centralized logging utility for PoF3 pipeline
+"""
+
 import logging
 import os
+import sys
 from datetime import datetime
+from pathlib import Path
 
-LOG_ROOT = 'logs'
 
-def get_logger(module_name):
+LOG_DIR = "logs"
+
+
+def setup_logger(step_name: str, log_dir: str = None) -> logging.Logger:
+    """Setup logger for pipeline steps 01, 02, 03"""
+    if log_dir is None:
+        log_dir = LOG_DIR
+
+    os.makedirs(log_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(log_dir, f"{step_name}_{ts}.log")
+
+    logger = logging.getLogger(step_name)
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(
+        logging.Formatter(
+            "%(asctime)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    logger.addHandler(fh)
+
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(ch)
+
+    return logger
+
+
+def get_logger(module_name: str, log_file: Path = None) -> logging.Logger:
+    """Get logger for pipeline steps 04, 05"""
     logger = logging.getLogger(module_name)
 
     if logger.handlers:
@@ -12,19 +52,26 @@ def get_logger(module_name):
 
     logger.setLevel(logging.INFO)
 
-    session = datetime.now().strftime('%Y%m%d_%H%M%S')
-    session_dir = os.path.join(LOG_ROOT, session)
-    os.makedirs(session_dir, exist_ok=True)
+    if log_file is None:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = Path(LOG_DIR) / f"{module_name}_{ts}.log"
+    else:
+        os.makedirs(log_file.parent, exist_ok=True)
 
-    logfile = os.path.join(session_dir, f"{module_name}.log")
-
-    handler = logging.FileHandler(logfile, encoding='utf-8')
-    formatter = logging.Formatter(
-        '[%(asctime)s] %(levelname)s - %(name)s: %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+    fh = logging.FileHandler(str(log_file), encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(
+        logging.Formatter(
+            "%(asctime)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
     )
-    handler.setFormatter(formatter)
+    logger.addHandler(fh)
 
-    logger.addHandler(handler)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(ch)
 
     return logger

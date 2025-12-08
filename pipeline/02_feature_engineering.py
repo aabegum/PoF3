@@ -18,8 +18,16 @@ import sys
 import logging
 from datetime import datetime
 
+# Add project root to Python path for utils import
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 import numpy as np
 import pandas as pd
+
+# Import safe date parser
+from utils.date_parser import parse_date_safely
 
 # UTF-8 stdout for Windows
 try:
@@ -145,12 +153,12 @@ def main():
             events = pd.DataFrame()
         else:
             events = pd.read_csv(events_path, encoding="utf-8-sig")
-            events["Ariza_Baslangic_Zamani"] = pd.to_datetime(
-                events["Ariza_Baslangic_Zamani"], errors="coerce", dayfirst=True
-            )
+            events["Ariza_Baslangic_Zamani"] = events["Ariza_Baslangic_Zamani"].apply(parse_date_safely)
+            # Normalize CBS_ID to lowercase for internal processing
+            events.rename(columns={"CBS_ID": "cbs_id"}, inplace=True)
 
         equipment = pd.read_csv(eq_path, encoding="utf-8-sig")
-        equipment["Kurulum_Tarihi"] = pd.to_datetime(equipment["Kurulum_Tarihi"], errors="coerce", dayfirst=True)
+        equipment["Kurulum_Tarihi"] = equipment["Kurulum_Tarihi"].apply(parse_date_safely)
         analysis_dt = pd.to_datetime(ANALYSIS_DATE)
 
         logger.info(f"[OK] Loaded equipment master: {len(equipment):,} rows.")
@@ -158,16 +166,24 @@ def main():
 
         # -------------------------------------------------------------------------
         # Base feature set from equipment_master
+        # Note: Column names are in Turkish as saved by 01_data_processing
         # -------------------------------------------------------------------------
         features = equipment[[
-            "cbs_id",
+            "CBS_ID",
             "Ekipman_Tipi",
             "Kurulum_Tarihi",
             "Ekipman_Yasi_Gun",
-            "Has_Ariza_Gecmisi",
-            "Fault_Count",
+            "Ariza_Gecmisine_Sahip",
+            "Toplam_Ariza_Sayisi",
             "Ilk_Ariza_Tarihi",
         ]].copy()
+
+        # Normalize column names for internal processing
+        features.rename(columns={
+            "CBS_ID": "cbs_id",
+            "Ariza_Gecmisine_Sahip": "Has_Ariza_Gecmisi",
+            "Toplam_Ariza_Sayisi": "Fault_Count",
+        }, inplace=True)
 
         # Days since last failure
         if not events.empty:
@@ -178,9 +194,7 @@ def main():
                 .rename("Son_Ariza_Tarihi")
             )
             features = features.merge(last_fault, on="cbs_id", how="left")
-            features["Son_Ariza_Tarihi"] = pd.to_datetime(
-                features["Son_Ariza_Tarihi"], errors="coerce", dayfirst=True
-            )
+            features["Son_Ariza_Tarihi"] = features["Son_Ariza_Tarihi"].apply(parse_date_safely)
             features["Son_Ariza_Gun_Sayisi"] = (analysis_dt - features["Son_Ariza_Tarihi"]).dt.days
         else:
             features["Son_Ariza_Tarihi"] = pd.NaT
