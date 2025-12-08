@@ -49,3 +49,5 @@ data/intermediate/
 data/outputs/
 data/inputs/arsiv/
 #data/inputs/
+catboost_info/
+models/
