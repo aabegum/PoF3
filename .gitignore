@@ -1,7 +1,7 @@
 # Logs and temp files
 *.log
 logs/
-
+loglar/
 # Environment variables
 .env
 .env.local

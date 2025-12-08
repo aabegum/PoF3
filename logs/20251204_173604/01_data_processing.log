@@ -1,6 +1,0 @@
-[2025-12-04 17:36:04] INFO - 01_data_processing: ==============================
-[2025-12-04 17:36:04] INFO - 01_data_processing: STEP 01: DATA PROCESSING START
-[2025-12-04 17:36:04] INFO - 01_data_processing: ==============================
-[2025-12-04 17:36:04] INFO - 01_data_processing: Loading fault data: /workspace/data/inputs/fault_merged_data.xlsx
-[2025-12-04 17:37:18] INFO - 01_data_processing: Fault records loaded: 10,884
-[2025-12-04 17:37:18] INFO - 01_data_processing: Loading healthy data: /workspace/data/inputs/healthy_merged_data.xlsx
