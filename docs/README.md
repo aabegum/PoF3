@@ -11,7 +11,7 @@ PoF3 dört ana analitik adım + opsiyonel görselleştirme modülünden oluşur:
 
 1. **01_data_processing.py**  
    - Arıza + sağlıklı ekipman verilerini okur  
-   - Kolon sözleşmelerini uygular (cause code, started at, ended at, duration time, cbs_id, Sebekeye_Baglanma_Tarihi, vb.)  
+   - Kullanılacak sütunları uygular (cause code, started at, ended at, duration time, cbs_id, Sebekeye_Baglanma_Tarihi, vb.)  
    - Mixed dataset (sağlıklı + arızalı) yapısını hazırlar  
    - Çıktılar:
      - `data/intermediate/fault_events_clean.csv`
@@ -25,13 +25,13 @@ PoF3 dört ana analitik adım + opsiyonel görselleştirme modülünden oluşur:
      - Kronik 90 gün flag (`Chronic_90d_Flag` / `Kronik_90G_Flag`)
    - Çıktı:
      - `data/intermediate/features_pof3.csv`
-
+test set cross validation
 3. **03_survival_models.py**  
    - `survival_base` + `features_pof3` üzerinden Cox PH ile survival modeli kurar  
-   - 3M / 6M / 12M için PoF (arıza olasılığı) üretir  
+   - 3M / 6M / 12M /24M (ekle) için PoF (arıza olasılığı) üretir  
    - Çıktılar:
      - `data/outputs/pof_cox_3m.csv`
-     - `data/outputs/pof_cox_6m.csv`
+     - `data/outputs/pof_cox_6m.csv`(gerek yok gibi)
      - `data/outputs/pof_cox_12m.csv`
 
 4. **04_chronic_detection.py**  

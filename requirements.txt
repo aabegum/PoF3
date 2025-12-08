@@ -1,0 +1,37 @@
+# ------------------------------
+# Core scientific stack (stable)
+# ------------------------------
+numpy==1.26.4
+pandas==2.1.4
+scipy==1.11.4
+
+# ------------------------------
+# Survival analysis
+# ------------------------------
+lifelines==0.27.8
+scikit-survival==0.22.3
+scikit-learn==1.3.2
+
+# ------------------------------
+# ML models (optional add-on)
+# ------------------------------
+xgboost==2.0.3
+catboost==1.2.3
+
+# ------------------------------
+# Logging, utilities
+# ------------------------------
+pyyaml==6.0.1
+
+# ------------------------------
+# Optional helpers
+# ------------------------------
+matplotlib==3.8.2
+tqdm==4.66.1
+joblib==1.3.2
+
+# ------------------------------
+# Windows-specific fixes
+# ------------------------------
+# Ensures UTF-8 console compatibility; avoids locale errors
+colorama==0.4.6
