@@ -127,8 +127,6 @@ def compute_mtbf_and_chronic(events: pd.DataFrame,
 
         # MTBF hesaplama
         if n_faults < 2:
-            # For equipment with fewer than 2 failures, set MTBF to NaN initially
-            # The main processing will handle imputation later
             mtbf = np.nan
         else:
             diffs = np.diff(times).astype("timedelta64[D]").astype(int)
@@ -302,24 +300,6 @@ def main():
             features["Kronik_Gozlem"] = features["Kronik_Gozlem"].fillna(0).astype(int)
             features["Kronik_90g_Flag"] = features["Kronik_90g_Flag"].fillna(0).astype(int)
             features["Kronik_Seviye_Max"] = features["Kronik_Seviye_Max"].fillna("NORMAL")
-            
-            # Better MTBF imputation: use equipment age for equipment with no MTBF data
-            # If MTBF is NaN, estimate based on equipment age and failure history
-            mask_nan_mtbf = features["MTBF_Gun"].isna()
-            if mask_nan_mtbf.any():
-                # For equipment with no MTBF (fewer than 2 failures), estimate based on equipment age
-                # and whether they have any failure history
-                for idx in features[mask_nan_mtbf].index:
-                    cbs_id = features.loc[idx, "cbs_id"]
-                    has_fault_history = features.loc[idx, "Ariza_Sayisi"] > 0 if "Ariza_Sayisi" in features.columns else False
-                    equipment_age = features.loc[idx, "Ekipman_Yasi_Gun"] if "Ekipman_Yasi_Gun" in features.columns else 365.0  # default to 1 year
-                    
-                    if has_fault_history and equipment_age > 0:
-                        # If there was at least one failure, use equipment age as a conservative estimate
-                        features.loc[idx, "MTBF_Gun"] = min(float(equipment_age), 1825.0)  # Cap at 5 years
-                    else:
-                        # If no failures, use a high MTBF value indicating reliability
-                        features.loc[idx, "MTBF_Gun"] = 3650.0  # 10 years for very reliable equipment
         else:
             features["MTBF_Gun"] = np.nan
             features["Kronik_Kritik"] = 0
@@ -351,51 +331,31 @@ def main():
         # Önce bu kolonları equipment'tan çek
         extra_cols = [c for c in bakim_cols + attr_cols if c in equipment.columns]
         if extra_cols:
-            extra_df = equipment[[\"cbs_id\"] + extra_cols].copy()
-            features = features.merge(extra_df, on=\"cbs_id\", how=\"left\")
+            extra_df = equipment[["cbs_id"] + extra_cols].copy()
+            features = features.merge(extra_df, on="cbs_id", how="left")
 
-        # Bakım sayısı ve bayraklar - improve handling for missing values
-        if \"Bakim_Sayisi\" in features.columns:
-            features[\"Bakim_Sayisi\"] = features[\"Bakim_Sayisi\"].fillna(0).astype(int)
-            features[\"Bakim_Var_Mi\"] = (features[\"Bakim_Sayisi\"] > 0).astype(int)
+        # Bakım sayısı ve bayraklar
+        if "Bakim_Sayisi" in features.columns:
+            features["Bakim_Sayisi"] = features["Bakim_Sayisi"].fillna(0).astype(int)
+            features["Bakim_Var_Mi"] = (features["Bakim_Sayisi"] > 0).astype(int)
         else:
-            features[\"Bakim_Sayisi\"] = 0
-            features[\"Bakim_Var_Mi\"] = 0
+            features["Bakim_Sayisi"] = 0
+            features["Bakim_Var_Mi"] = 0
 
-        # Better handling for maintenance date columns to reduce NA regions
-        # If maintenance data is missing, assume no maintenance was performed
-        if \"Son_Bakim_Tarihi\" not in features.columns:
-            features[\"Son_Bakim_Tarihi\"] = pd.NaT  # No maintenance record
-        if \"Ilk_Bakim_Tarihi\" not in features.columns:
-            features[\"Ilk_Bakim_Tarihi\"] = pd.NaT  # No maintenance record
-            
-        # Calculate days since last maintenance with better handling
-        if \"Son_Bakimdan_Gecen_Gun\" in features.columns:
+        # Son_Bakimdan_Gecen_Gun yoksa Son_Bakim_Tarihi üzerinden hesapla
+        if "Son_Bakimdan_Gecen_Gun" in features.columns:
             # Mevcut değerleri koru; NaN olanları tarih üzerinden doldur
-            mask_nan = features[\"Son_Bakimdan_Gecen_Gun\"].isna()
-            if \"Son_Bakim_Tarihi\" in features.columns:
-                tmp_days = (analysis_dt - features[\"Son_Bakim_Tarihi\"]).dt.days
-                features.loc[mask_nan, \"Son_Bakimdan_Gecen_Gun\"] = tmp_days[mask_nan]
-                # For equipment with no maintenance record (NaT), use equipment age as proxy
-                mask_nat = features[\"Son_Bakim_Tarihi\"].isna()
-                if mask_nat.any():
-                    equipment_age = (analysis_dt - features[\"Kurulum_Tarihi\"]).dt.days
-                    features.loc[mask_nat & mask_nan, \"Son_Bakimdan_Gecen_Gun\"] = equipment_age[mask_nat & mask_nan]
+            mask_nan = features["Son_Bakimdan_Gecen_Gun"].isna()
+            if "Son_Bakim_Tarihi" in features.columns:
+                tmp_days = (analysis_dt - features["Son_Bakim_Tarihi"]).dt.days
+                features.loc[mask_nan, "Son_Bakimdan_Gecen_Gun"] = tmp_days[mask_nan]
         else:
-            if \"Son_Bakim_Tarihi\" in features.columns:
-                features[\"Son_Bakimdan_Gecen_Gun\"] = (
-                    analysis_dt - features[\"Son_Bakim_Tarihi\"]
+            if "Son_Bakim_Tarihi" in features.columns:
+                features["Son_Bakimdan_Gecen_Gun"] = (
+                    analysis_dt - features["Son_Bakim_Tarihi"]
                 ).dt.days
-                # Handle NaT values by using equipment age
-                mask_nat = features[\"Son_Bakim_Tarihi\"].isna()
-                if mask_nat.any():
-                    equipment_age = (analysis_dt - features[\"Kurulum_Tarihi\"]).dt.days
-                    features.loc[mask_nat, \"Son_Bakimdan_Gecen_Gun\"] = equipment_age[mask_nat]
             else:
-                # If no maintenance record, assume days since equipment installation
-                features[\"Son_Bakimdan_Gecen_Gun\"] = (
-                    analysis_dt - features[\"Kurulum_Tarihi\"]
-                ).dt.days
+                features["Son_Bakimdan_Gecen_Gun"] = np.nan
 
         # -------------------------------------------------
         # 6) Tip düzeltmeleri & doldurmalar

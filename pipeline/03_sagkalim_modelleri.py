@@ -398,12 +398,12 @@ def fit_cox_model(df_cox: pd.DataFrame, logger: logging.Logger) -> CoxPHFitter:
 def compute_pof_from_cox(
     cph: CoxPHFitter,
     df_cox: pd.DataFrame,
-    horizons_days,
+    horizons_months,
     logger: logging.Logger,
 ) -> dict:
     """
     Cox modeli üzerinden farklı ufuklar için PoF hesaplar.
-    Dönüş: {days: pd.Series(index=cbs_id, values=PoF)}
+    Dönüş: {ay: pd.Series(index=cbs_id, values=PoF)}
     """
     logger.info("[STEP] Cox modeli ile PoF hesaplanıyor")
 
@@ -413,10 +413,9 @@ def compute_pof_from_cox(
 
     results = {}
 
-    for days in horizons_days:
-        # Convert days to months for labeling
-        months = round(days / 30)
-        logger.info(f"  Ufuk: {days} gün (~{months} ay)")
+    for m in horizons_months:
+        days = m * 30
+        logger.info(f"  Ufuk: {m} ay ({days} gün)")
 
         try:
             surv = cph.predict_survival_function(X, times=[days]).T
@@ -494,7 +493,7 @@ def fit_rsf_model(df_cox: pd.DataFrame, logger: logging.Logger):
 def compute_pof_from_rsf(
     rsf_model,
     df_cox: pd.DataFrame,
-    horizons_days,
+    horizons_months,
     logger: logging.Logger,
 ) -> dict:
     if rsf_model is None:
@@ -511,10 +510,9 @@ def compute_pof_from_rsf(
 
     surv_fns = rsf_model.predict_survival_function(X)
 
-    for days in horizons_days:
-        # Convert days to months for labeling
-        months = round(days / 30)
-        logger.info(f"  RSF ufuk: {days} gün (~{months} ay)")
+    for m in horizons_months:
+        days = m * 30
+        logger.info(f"  RSF ufuk: {m} ay ({days} gün)")
 
         try:
             pof_vals = np.array([1.0 - fn(days) for fn in surv_fns])
@@ -719,14 +717,13 @@ def train_leakage_free_ml_models(df, logger):
     all_feature_cols = numeric_cols + binary_cols + cat_cols
 
     X_num = df[numeric_cols].copy()
-    X_bin = df[binary_cols].copy() if binary_cols else pd.DataFrame(index=df.index)
     X_cat = df[cat_cols].astype(str)
 
-    # XGBoost: numerical + binary + one-hot categorical
-    X_xgb = pd.concat([X_num, X_bin, pd.get_dummies(X_cat, drop_first=True)], axis=1)
+    # XGBoost: numerical + one-hot
+    X_xgb = pd.concat([X_num, pd.get_dummies(X_cat, drop_first=True)], axis=1)
 
-    # CatBoost: numerical + binary + categorical
-    X_catb = pd.concat([X_num, X_bin, X_cat], axis=1)
+    # CatBoost: numerical + categorical
+    X_catb = pd.concat([X_num, X_cat], axis=1)
     cat_idx = [X_catb.columns.get_loc(c) for c in cat_cols]
 
     from sklearn.model_selection import train_test_split
@@ -932,8 +929,7 @@ def main():
         cph = fit_cox_model(df_cox, logger)
         logger.info("")
 
-        # Use actual days from config and convert to months for labeling
-        pof_cox = compute_pof_from_cox(cph, df_cox, [int(d/30) for d in SURVIVAL_HORIZONS], logger)
+        pof_cox = compute_pof_from_cox(cph, df_cox, SURVIVAL_HORIZONS_MONTHS, logger)
         logger.info("")
 
         # --------------------------------------------------------------
@@ -942,16 +938,14 @@ def main():
         logger.info("[STEP] Cox PoF çıktılarını kaydetme")
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-        for days, series in pof_cox.items():
-            # Convert days to months for labeling
-            months = round(days / 30)
+        for m, series in pof_cox.items():
             out_df = pd.DataFrame(
                 {
                     "cbs_id": series.index,
-                    f"PoF_Cox_{months}Ay": series.values,
+                    f"PoF_Cox_{m}Ay": series.values,
                 }
             )
-            out_path = os.path.join(OUTPUT_DIR, f"cox_sagkalim_{months}ay_ariza_olasiligi.csv")
+            out_path = os.path.join(OUTPUT_DIR, f"cox_sagkalim_{m}ay_ariza_olasiligi.csv")
             out_df.to_csv(out_path, index=False, encoding="utf-8-sig")
             logger.info(f"[OK] {out_path}")
 
@@ -961,20 +955,18 @@ def main():
         logger.info("")
         logger.info("[STEP] Random Survival Forest (RSF) adımı")
         rsf = fit_rsf_model(df_cox, logger)
-        rsf_pof = compute_pof_from_rsf(rsf, df_cox, [int(d/30) for d in SURVIVAL_HORIZONS], logger)
+        rsf_pof = compute_pof_from_rsf(rsf, df_cox, SURVIVAL_HORIZONS_MONTHS, logger)
 
         if rsf_pof:
             logger.info("[STEP] RSF PoF çıktılarını kaydetme")
-            for days, series in rsf_pof.items():
-                # Convert days to months for labeling
-                months = round(days / 30)
+            for m, series in rsf_pof.items():
                 out_df = pd.DataFrame(
                     {
                         "cbs_id": series.index,
-                        f"PoF_RSF_{months}Ay": series.values,
+                        f"PoF_RSF_{m}Ay": series.values,
                     }
                 )
-                out_path = os.path.join(OUTPUT_DIR, f"rsf_sagkalim_{months}ay_ariza_olasiligi.csv")
+                out_path = os.path.join(OUTPUT_DIR, f"rsf_sagkalim_{m}ay_ariza_olasiligi.csv")
                 out_df.to_csv(out_path, index=False, encoding="utf-8-sig")
                 logger.info(f"[OK] {out_path}")
         else:
