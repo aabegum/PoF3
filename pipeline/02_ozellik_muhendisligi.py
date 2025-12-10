@@ -39,7 +39,9 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
-
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 # UTF-8 konsol
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -94,39 +96,115 @@ def setup_logger() -> logging.Logger:
 
 
 # ---------------------------------------------------------
-# MTBF & Kronik Hesaplama
+# MTBF & Kronik Hesaplama (Çok Seviyeli)
 # ---------------------------------------------------------
 
 def compute_mtbf_and_chronic(events: pd.DataFrame,
                              logger: logging.Logger) -> pd.DataFrame:
     """
-    MTBF (Mean Time Between Failures) ve 90 günlük kronik flag hesaplar.
+    MTBF (Mean Time Between Failures) ve çok seviyeli kronik flag hesaplar.
+
+    Kronik Seviyeleri:
+    - Kronik_Kritik:  3+ arıza 90 günde  (ACİL MÜDAHALE)
+    - Kronik_Yuksek:  4+ arıza 365 günde (ÖNCELİKLİ)
+    - Kronik_Orta:    3+ arıza 365 günde (TAKİP)
+    - Kronik_Gozlem:  2+ arıza 180 günde (İZLEME)
+    - Kronik_90g_Flag: Geriye dönük uyumluluk için (herhangi iki arıza arası <= 90 gün)
     """
     if events.empty:
-        return pd.DataFrame(columns=["cbs_id", "MTBF_Gun", "Kronik_90g_Flag"])
+        return pd.DataFrame(columns=[
+            "cbs_id", "MTBF_Gun",
+            "Kronik_Kritik", "Kronik_Yuksek", "Kronik_Orta", "Kronik_Gozlem",
+            "Kronik_90g_Flag", "Kronik_Seviye_Max"
+        ])
 
     events = events.sort_values(["cbs_id", "Ariza_Baslangic_Zamani"])
-    mtbf_records = []
-    chronic_records = []
+    records = []
 
     for cbs_id, grp in events.groupby("cbs_id"):
         times = grp["Ariza_Baslangic_Zamani"].dropna().sort_values().values
+        n_faults = len(times)
 
-        if len(times) < 2:
+        # MTBF hesaplama
+        if n_faults < 2:
             mtbf = np.nan
-            chronic_flag = 0
         else:
             diffs = np.diff(times).astype("timedelta64[D]").astype(int)
             mtbf = float(np.mean(diffs))
-            chronic_flag = int((diffs <= CHRONIC_WINDOW_DAYS).any())
 
-        mtbf_records.append((cbs_id, mtbf))
-        chronic_records.append((cbs_id, chronic_flag))
+        # Kronik seviye hesaplama
+        kronik_kritik = 0  # 3+ arıza 90 günde
+        kronik_yuksek = 0  # 4+ arıza 365 günde
+        kronik_orta = 0    # 3+ arıza 365 günde
+        kronik_gozlem = 0  # 2+ arıza 180 günde
+        kronik_90g = 0     # Geriye dönük uyumluluk
 
-    mtbf_df = pd.DataFrame(mtbf_records, columns=["cbs_id", "MTBF_Gun"])
-    chronic_df = pd.DataFrame(chronic_records, columns=["cbs_id", "Kronik_90g_Flag"])
+        if n_faults >= 2:
+            # 90 günlük pencere kontrolü (Kritik)
+            for i in range(len(times) - 2):
+                window = (times[i+2] - times[i]).astype('timedelta64[D]').astype(int)
+                if window <= 90:
+                    kronik_kritik = 1
+                    break
 
-    out = mtbf_df.merge(chronic_df, on="cbs_id", how="outer")
+            # 180 günlük pencere kontrolü (Gözlem)
+            for i in range(len(times) - 1):
+                window = (times[i+1] - times[i]).astype('timedelta64[D]').astype(int)
+                if window <= 180 and n_faults >= 2:
+                    kronik_gozlem = 1
+                    break
+
+            # 365 günlük pencere kontrolü (Orta)
+            if n_faults >= 3:
+                for i in range(len(times) - 2):
+                    window = (times[i+2] - times[i]).astype('timedelta64[D]').astype(int)
+                    if window <= 365:
+                        kronik_orta = 1
+                        break
+
+            # 365 günlük pencere kontrolü (Yüksek)
+            if n_faults >= 4:
+                for i in range(len(times) - 3):
+                    window = (times[i+3] - times[i]).astype('timedelta64[D]').astype(int)
+                    if window <= 365:
+                        kronik_yuksek = 1
+                        break
+
+            # Geriye dönük uyumluluk: herhangi iki arıza arası <= 90 gün
+            diffs = np.diff(times).astype("timedelta64[D]").astype(int)
+            kronik_90g = int((diffs <= CHRONIC_WINDOW_DAYS).any())
+
+        # En yüksek kronik seviyeyi belirle
+        if kronik_kritik == 1:
+            kronik_seviye = "KRITIK"
+        elif kronik_yuksek == 1:
+            kronik_seviye = "YUKSEK"
+        elif kronik_orta == 1:
+            kronik_seviye = "ORTA"
+        elif kronik_gozlem == 1:
+            kronik_seviye = "GOZLEM"
+        else:
+            kronik_seviye = "NORMAL"
+
+        records.append((
+            cbs_id, mtbf,
+            kronik_kritik, kronik_yuksek, kronik_orta, kronik_gozlem,
+            kronik_90g, kronik_seviye
+        ))
+
+    out = pd.DataFrame(records, columns=[
+        "cbs_id", "MTBF_Gun",
+        "Kronik_Kritik", "Kronik_Yuksek", "Kronik_Orta", "Kronik_Gozlem",
+        "Kronik_90g_Flag", "Kronik_Seviye_Max"
+    ])
+
+    # Log kronik dağılımı
+    logger.info("[INFO] Kronik seviye dağılımı:")
+    for seviye in ["KRITIK", "YUKSEK", "ORTA", "GOZLEM", "NORMAL"]:
+        count = (out["Kronik_Seviye_Max"] == seviye).sum()
+        pct = count / len(out) * 100 if len(out) > 0 else 0
+        logger.info(f"  {seviye}: {count:,} ekipman ({pct:.1f}%)")
+
     return out
 
 
@@ -209,14 +287,27 @@ def main():
             features["Son_Ariza_Gun_Sayisi"] = np.nan
 
         # -------------------------------------------------
-        # 4) MTBF + kronik (90g) flag
+        # 4) MTBF + kronik (çok seviyeli) flags
         # -------------------------------------------------
         if not events.empty:
             mtbf_df = compute_mtbf_and_chronic(events, logger)
             features = features.merge(mtbf_df, on="cbs_id", how="left")
+
+            # Arızası olmayan ekipmanlar için varsayılan değerler
+            features["Kronik_Kritik"] = features["Kronik_Kritik"].fillna(0).astype(int)
+            features["Kronik_Yuksek"] = features["Kronik_Yuksek"].fillna(0).astype(int)
+            features["Kronik_Orta"] = features["Kronik_Orta"].fillna(0).astype(int)
+            features["Kronik_Gozlem"] = features["Kronik_Gozlem"].fillna(0).astype(int)
+            features["Kronik_90g_Flag"] = features["Kronik_90g_Flag"].fillna(0).astype(int)
+            features["Kronik_Seviye_Max"] = features["Kronik_Seviye_Max"].fillna("NORMAL")
         else:
             features["MTBF_Gun"] = np.nan
+            features["Kronik_Kritik"] = 0
+            features["Kronik_Yuksek"] = 0
+            features["Kronik_Orta"] = 0
+            features["Kronik_Gozlem"] = 0
             features["Kronik_90g_Flag"] = 0
+            features["Kronik_Seviye_Max"] = "NORMAL"
 
         # -------------------------------------------------
         # 5) Bakım & ekipman nitelikleri (equipment_master içinden)

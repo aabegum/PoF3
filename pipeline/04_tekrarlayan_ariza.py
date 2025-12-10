@@ -15,16 +15,33 @@ import numpy as np
 import pandas as pd
 
 from utils.logger import get_logger
-
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 # --------------------------------------------------------------------
 # Paths / Config
 # --------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = BASE_DIR / "data"
-INPUT_DIR = DATA_DIR / "inputs"
-INTERMEDIATE_DIR = DATA_DIR / "intermediate"
-OUTPUT_DIR = DATA_DIR / "outputs"
-LOG_DIR = BASE_DIR / "logs"
+
+# Config dosyasından ayarları al
+try:
+    from config.config import (
+        INTERMEDIATE_PATHS,
+        OUTPUT_DIR as CONFIG_OUTPUT_DIR,
+        LOG_DIR as CONFIG_LOG_DIR,
+        ANALYSIS_DATE as CONFIG_ANALYSIS_DATE,
+    )
+    INTERMEDIATE_DIR = Path(list(INTERMEDIATE_PATHS.values())[0]).parent
+    OUTPUT_DIR = Path(CONFIG_OUTPUT_DIR)
+    LOG_DIR = Path(CONFIG_LOG_DIR)
+    ANALYSIS_DATE = pd.to_datetime(CONFIG_ANALYSIS_DATE).to_pydatetime()
+except Exception:
+    # Fallback
+    DATA_DIR = BASE_DIR / "data"
+    INTERMEDIATE_DIR = DATA_DIR / "ara_ciktilar"
+    OUTPUT_DIR = DATA_DIR / "sonuclar"
+    LOG_DIR = BASE_DIR / "loglar"
+    ANALYSIS_DATE = datetime(2025, 12, 4)
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -32,13 +49,13 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / f"04_chronic_detection_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 logger = get_logger("04_chronic_detection", LOG_FILE)
 
-# Esnek ama deterministic analiz tarihi
-ANALYSIS_DATE = datetime(2025, 12, 4)
-
-# Kronik tanım parametreleri (gerekirse config.py'ye taşınabilir)
-CHRONIC_WINDOW_DAYS = 365          # Son 12 ay
-CHRONIC_MIN_FAULTS_IEEE = 3        # IEEE benzeri: 12 ayda en az 3 arıza
-CHRONIC_LAMBDA_ALERT = 2.0         # λ > 2 arıza / yıl ise raporlanır (flag değil, uyarı)
+# Kronik tanım parametreleri - Çok Seviyeli Sistem
+CHRONIC_DEFINITIONS = {
+    "KRITIK": {"window_days": 90, "min_faults": 3, "desc": "3+ arıza 90 günde - ACİL MÜDAHALE"},
+    "YUKSEK": {"window_days": 365, "min_faults": 4, "desc": "4+ arıza 12 ayda - ÖNCELİKLİ"},
+    "ORTA": {"window_days": 365, "min_faults": 3, "desc": "3+ arıza 12 ayda - TAKİP"},
+    "GOZLEM": {"window_days": 180, "min_faults": 2, "desc": "2+ arıza 6 ayda - İZLEME"},
+}
 
 
 # --------------------------------------------------------------------
@@ -61,26 +78,34 @@ def load_intermediate_data():
         logger.error(f"[FATAL] equipment_master.csv bulunamadı: {equipment_path}")
         raise FileNotFoundError(equipment_path)
 
-    features_path = INTERMEDIATE_DIR / "features_pof3.csv"
+    # Türkçe isimlendirilmiş özellik dosyası
+    features_path = INTERMEDIATE_DIR / "ozellikler_pof3.csv"
     if not features_path.exists():
-        logger.warning(f"[WARN] features_pof3.csv bulunamadı: {features_path}")
-        features = None
+        # Fallback: eski İngilizce isim
+        features_path = INTERMEDIATE_DIR / "features_pof3.csv"
+        if not features_path.exists():
+            logger.warning(f"[WARN] ozellikler_pof3.csv bulunamadı: {INTERMEDIATE_DIR / 'ozellikler_pof3.csv'}")
+            features = None
+        else:
+            features = pd.read_csv(features_path, encoding="utf-8-sig")
     else:
-        features = pd.read_csv(features_path)
+        features = pd.read_csv(features_path, encoding="utf-8-sig")
 
     events = pd.read_csv(
         events_path,
+        encoding="utf-8-sig",
         parse_dates=["Ariza_Baslangic_Zamani", "Ariza_Bitis_Zamani", "Kurulum_Tarihi"]
     )
     equipment = pd.read_csv(
         equipment_path,
+        encoding="utf-8-sig",
         parse_dates=["Kurulum_Tarihi", "Ilk_Ariza_Tarihi"]
     )
 
     logger.info(f"[OK] Yüklenen fault events: {len(events):,} kayıt")
     logger.info(f"[OK] Yüklenen equipment master: {len(equipment):,} kayıt")
     if features is not None:
-        logger.info(f"[OK] Yüklenen features_pof3: {len(features):,} kayıt")
+        logger.info(f"[OK] Yüklenen ozellikler_pof3: {len(features):,} kayıt")
 
     return events, equipment, features
 
@@ -89,13 +114,13 @@ def build_chronic_table(events: pd.DataFrame, equipment: pd.DataFrame) -> pd.Dat
     logger.info("")
     logger.info("[STEP] Ekipman bazında kronik metriklerin hesaplanması")
 
-    # Beklenen kolonlar
-    required_event_cols = ["CBS_ID", "Ariza_Baslangic_Zamani"]
+    # Beklenen kolonlar (Türkçe standart: küçük harf cbs_id)
+    required_event_cols = ["cbs_id", "Ariza_Baslangic_Zamani"]
     for col in required_event_cols:
         if col not in events.columns:
             raise KeyError(f"[FATAL] fault_events_clean içerisinde '{col}' kolonu bulunamadı.")
 
-    required_eq_cols = ["CBS_ID", "Kurulum_Tarihi", "Ekipman_Tipi"]
+    required_eq_cols = ["cbs_id", "Kurulum_Tarihi", "Ekipman_Tipi"]
     for col in required_eq_cols:
         if col not in equipment.columns:
             raise KeyError(f"[FATAL] equipment_master içerisinde '{col}' kolonu bulunamadı.")
@@ -104,16 +129,16 @@ def build_chronic_table(events: pd.DataFrame, equipment: pd.DataFrame) -> pd.Dat
     ev = events.copy()
     eq = equipment.copy()
 
-    # Eksik CBS_ID filtrele
-    ev = ev.dropna(subset=["CBS_ID"])
-    eq = eq.dropna(subset=["CBS_ID"])
+    # Eksik cbs_id filtrele
+    ev = ev.dropna(subset=["cbs_id"])
+    eq = eq.dropna(subset=["cbs_id"])
 
-    # Gözlem penceresi
-    window_start = ANALYSIS_DATE - timedelta(days=CHRONIC_WINDOW_DAYS)
+    # Gözlem penceresi (12 aylık - ORTA seviye kullanılır)
+    window_start = ANALYSIS_DATE - timedelta(days=CHRONIC_DEFINITIONS["ORTA"]["window_days"])
 
     # Temel arıza istatistikleri
     logger.info("[INFO] Ekipman bazında temel arıza istatistikleri hesaplanıyor...")
-    grp = ev.groupby("CBS_ID")
+    grp = ev.groupby("cbs_id")
 
     stats = grp["Ariza_Baslangic_Zamani"].agg(
         Ilk_Ariza_Tarihi=("min"),
@@ -125,21 +150,21 @@ def build_chronic_table(events: pd.DataFrame, equipment: pd.DataFrame) -> pd.Dat
     recent_mask = ev["Ariza_Baslangic_Zamani"] >= window_start
     recent_counts = (
         ev[recent_mask]
-        .groupby("CBS_ID")["Ariza_Baslangic_Zamani"]
+        .groupby("cbs_id")["Ariza_Baslangic_Zamani"]
         .count()
         .rename("Son12Ay_Ariza_Sayisi")
     )
 
     stats = stats.merge(
         recent_counts,
-        on="CBS_ID",
+        on="cbs_id",
         how="left"
     )
     stats["Son12Ay_Ariza_Sayisi"] = stats["Son12Ay_Ariza_Sayisi"].fillna(0).astype(int)
 
     # Kurulum tarihi + gözlem süresi (yıl)
-    eq_tmp = eq[["CBS_ID", "Kurulum_Tarihi", "Ekipman_Tipi"]].copy()
-    stats = stats.merge(eq_tmp, on="CBS_ID", how="left")
+    eq_tmp = eq[["cbs_id", "Kurulum_Tarihi", "Ekipman_Tipi"]].copy()
+    stats = stats.merge(eq_tmp, on="cbs_id", how="left")
 
     # Gözlem süresi (Kurulum → Analiz tarihi veya Son Arıza / Analiz tarihi)
     stats["Kurulum_Tarihi"] = pd.to_datetime(stats["Kurulum_Tarihi"], errors="coerce")
@@ -167,9 +192,9 @@ def build_chronic_table(events: pd.DataFrame, equipment: pd.DataFrame) -> pd.Dat
         f"(Median: {stats['Lambda_Yillik_Ariza'].median():.3f})"
     )
 
-    # IEEE-benzeri kronik flag: son 12 ayda ≥ 3 arıza
+    # IEEE-benzeri kronik flag: son 12 ayda ≥ 3 arıza (ORTA seviye)
     stats["Kronik_IEEE_Flag"] = (
-        (stats["Son12Ay_Ariza_Sayisi"] >= CHRONIC_MIN_FAULTS_IEEE).astype(int)
+        (stats["Son12Ay_Ariza_Sayisi"] >= CHRONIC_DEFINITIONS["ORTA"]["min_faults"]).astype(int)
     )
 
     chronic_rate = stats["Kronik_IEEE_Flag"].mean()
@@ -189,8 +214,8 @@ def merge_with_feature_flags(chronic_stats: pd.DataFrame, features: pd.DataFrame
         chronic_stats["Kronik_Birlesik_Flag"] = chronic_stats["Kronik_IEEE_Flag"]
         return chronic_stats
 
-    if "CBS_ID" not in features.columns:
-        logger.warning("[WARN] features_pof3 içinde CBS_ID kolonu yok; merge atlanıyor.")
+    if "cbs_id" not in features.columns:
+        logger.warning("[WARN] ozellikler_pof3 içinde cbs_id kolonu yok; merge atlanıyor.")
         chronic_stats["Kronik_90G_Flag"] = 0
         chronic_stats["Kronik_Birlesik_Flag"] = chronic_stats["Kronik_IEEE_Flag"]
         return chronic_stats
@@ -198,7 +223,7 @@ def merge_with_feature_flags(chronic_stats: pd.DataFrame, features: pd.DataFrame
     # Kolon adı feature tarafında farklı olabilir
     flag_cols = [c for c in features.columns if "Chronic" in c or "Kronik" in c]
     if not flag_cols:
-        logger.info("[INFO] features_pof3 içerisinde kronik flag kolonu bulunamadı.")
+        logger.info("[INFO] ozellikler_pof3 içerisinde kronik flag kolonu bulunamadı.")
         chronic_stats["Kronik_90G_Flag"] = 0
         chronic_stats["Kronik_Birlesik_Flag"] = chronic_stats["Kronik_IEEE_Flag"]
         return chronic_stats
@@ -206,11 +231,11 @@ def merge_with_feature_flags(chronic_stats: pd.DataFrame, features: pd.DataFrame
     chronic_flag_col = flag_cols[0]
     logger.info(f"[INFO] Kronik feature flag kolonu olarak '{chronic_flag_col}' kullanılacak.")
 
-    feat_subset = features[["CBS_ID", chronic_flag_col]].copy()
+    feat_subset = features[["cbs_id", chronic_flag_col]].copy()
     feat_subset.rename(columns={chronic_flag_col: "Kronik_90G_Flag"}, inplace=True)
     feat_subset["Kronik_90G_Flag"] = feat_subset["Kronik_90G_Flag"].fillna(0).astype(int)
 
-    merged = chronic_stats.merge(feat_subset, on="CBS_ID", how="left")
+    merged = chronic_stats.merge(feat_subset, on="cbs_id", how="left")
     merged["Kronik_90G_Flag"] = merged["Kronik_90G_Flag"].fillna(0).astype(int)
 
     # Birleşik flag: IEEE veya 90g kronik ise 1

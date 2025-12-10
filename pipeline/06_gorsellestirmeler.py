@@ -1,233 +1,324 @@
-# pipeline/06_visualizations.py
+"""
+06_gorsellestirmeler.py
+PoF3 – Türkçe Görselleştirme Modülü
 
-from pathlib import Path
-from datetime import datetime
+Amaç:
+- Özellik seti (ozellikler_pof3.csv) üzerinden:
+    * Ekipman yaşı dağılımı
+    * Ekipman tipi dağılımı
+    * MTBF dağılımı
+    * Kronik flag dağılımı
+- Survival base üzerinden:
+    * En büyük 3 ekipman tipi için KM eğrileri
+- Risk skorları üzerinden:
+    * Risk skoru dağılımı
+    * Risk sınıfı dağılımı
 
+Çıktı:
+    gorseller/plots_survival/01_ekipman_yasi_dagilimi.png
+    gorseller/plots_survival/02_ekipman_tipi_dagilimi.png
+    gorseller/plots_chronic/01_mtbf_dagilimi.png
+    gorseller/plots_chronic/02_kronik_flag_dagilimi.png
+    gorseller/plots_survival/04_km_en_buyuk_3_tur.png
+    gorseller/plots_risk/01_risk_skoru_dagilimi.png
+    gorseller/plots_risk/02_risk_sinifi_dagilimi.png
+"""
+
+import os
+import sys
+import logging
+
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+# Kaplan–Meier için
+from lifelines import KaplanMeierFitter
 
-from utils.logger import get_logger
-import sys, os
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+# UTF-8 konsol
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
-sys.stdout.reconfigure(encoding='utf-8')
+# Proje kökü
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-# --------------------------------------------------------------------
-# Paths
-# --------------------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = BASE_DIR / "data"
-INTERMEDIATE_DIR = DATA_DIR / "intermediate"
-OUTPUT_DIR = DATA_DIR / "outputs"
-VISUALS_DIR = BASE_DIR / "visuals"
-LOG_DIR = BASE_DIR / "logs"
+# ----------------------------------------------------------------------
+# CONFIG: config.config varsa kullan, yoksa makul varsayılanlar
+# ----------------------------------------------------------------------
+try:
+    from config.config import (
+        FEATURE_OUTPUT_PATH,
+        INTERMEDIATE_PATHS,
+        OUTPUT_DIR,
+        LOG_DIR,
+    )
+except Exception:
+    FEATURE_OUTPUT_PATH = os.path.join("data", "ara_ciktilar", "ozellikler_pof3.csv")
+    INTERMEDIATE_PATHS = {
+        "survival_base": os.path.join("data", "ara_ciktilar", "survival_base.csv"),
+    }
+    OUTPUT_DIR = os.path.join("data", "sonuclar")
+    LOG_DIR = "logs"
 
-(LOG_DIR).mkdir(parents=True, exist_ok=True)
-(VISUALS_DIR / "plots_survival").mkdir(parents=True, exist_ok=True)
-(VISUALS_DIR / "plots_chronic").mkdir(parents=True, exist_ok=True)
-(VISUALS_DIR / "plots_risk").mkdir(parents=True, exist_ok=True)
 
-LOG_FILE = LOG_DIR / f"06_visualizations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-logger = get_logger("06_visualizations", LOG_FILE)
+STEP_NAME = "06_gorsellestirmeler"
+PLOTS_ROOT_DIR = os.path.join("gorseller")
 
 
-# --------------------------------------------------------------------
-# 01 – Data Processing görselleri
-# --------------------------------------------------------------------
-def plot_age_and_type_distributions():
-    eq_path = INTERMEDIATE_DIR / "equipment_master.csv"
-    if not eq_path.exists():
-        logger.warning(f"[WARN] equipment_master.csv bulunamadı: {eq_path}")
+# ----------------------------------------------------------------------
+# LOGGING
+# ----------------------------------------------------------------------
+def setup_logger() -> logging.Logger:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    from datetime import datetime
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(LOG_DIR, f"{STEP_NAME}_{ts}.log")
+
+    logger = logging.getLogger(STEP_NAME)
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(fh)
+
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(ch)
+
+    logger.info("=" * 80)
+    logger.info(f"{STEP_NAME} - PoF3 Görselleştirme Modülü")
+    logger.info("=" * 80)
+    return logger
+
+
+logger = setup_logger()
+
+
+# ----------------------------------------------------------------------
+# Yardımcı: güvenli veri yükleme
+# ----------------------------------------------------------------------
+def safe_read_csv(path: str, desc: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        logger.warning(f"[WARN] {desc} dosyası bulunamadı: {path}")
+        return pd.DataFrame()
+    df = pd.read_csv(path, encoding="utf-8-sig")
+    logger.info(f"[OK] {desc} yüklendi: {len(df):,} satır")
+    return df
+
+
+# ----------------------------------------------------------------------
+# Yardımcı: figürü kaydet ve kapat
+# ----------------------------------------------------------------------
+def save_figure(fig, out_path: str, desc: str):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    logger.info(f"[OK] {desc} kaydedildi: {out_path}")
+
+
+# ----------------------------------------------------------------------
+# 1) Özellik tabanlı görseller
+# ----------------------------------------------------------------------
+def plot_feature_based_charts(features: pd.DataFrame):
+    if features.empty:
+        logger.warning("[WARN] Özellik seti boş – feature tabanlı grafikler atlanıyor.")
         return
 
-    df = pd.read_csv(eq_path)
-    # Ekipman yaş histogramı
-    if "Ekipman_Yasi_Gun" in df.columns:
-        plt.figure(figsize=(8, 5))
-        df["Ekipman_Yasi_Gun"].dropna().plot.hist(bins=40)
-        plt.xlabel("Ekipman Yaşı (gün)")
-        plt.ylabel("Ekipman Sayısı")
-        plt.title("Ekipman Yaşı Dağılımı")
-        out = VISUALS_DIR / "plots_survival" / "01_ekipman_yasi_dagilimi.png"
-        plt.tight_layout()
-        plt.savefig(out, dpi=150)
-        plt.close()
-        logger.info(f"[OK] Ekipman yaşı dağılım grafiği kaydedildi: {out}")
+    # 1. Ekipman yaşı dağılımı (gün)
+    if "Ekipman_Yasi_Gun" in features.columns:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        data = features["Ekipman_Yasi_Gun"].dropna()
+        ax.hist(data, bins=40)
+        ax.set_title("Ekipman Yaşı Dağılımı")
+        ax.set_xlabel("Ekipman Yaşı (gün)")
+        ax.set_ylabel("Ekipman Sayısı")
+        out_path = os.path.join(
+            PLOTS_ROOT_DIR, "plots_survival", "01_ekipman_yasi_dagilimi.png"
+        )
+        save_figure(fig, out_path, "Ekipman yaşı dağılım grafiği")
+    else:
+        logger.warning("[WARN] 'Ekipman_Yasi_Gun' kolonu yok – yaş dağılımı çizilemedi.")
 
-    # Ekipman tipi dağılımı
-    type_col = "Ekipman_Tipi" if "Ekipman_Tipi" in df.columns else None
-    if type_col:
-        plt.figure(figsize=(9, 5))
-        df[type_col].value_counts().sort_values(ascending=False).plot.bar()
-        plt.xlabel("Ekipman Tipi")
-        plt.ylabel("Ekipman Sayısı")
-        plt.title("Ekipman Tipi Dağılımı")
-        plt.xticks(rotation=45, ha="right")
-        out = VISUALS_DIR / "plots_survival" / "02_ekipman_tipi_dagilimi.png"
-        plt.tight_layout()
-        plt.savefig(out, dpi=150)
-        plt.close()
-        logger.info(f"[OK] Ekipman tipi dağılım grafiği kaydedildi: {out}")
+    # 2. Ekipman tipi dağılımı
+    if "Ekipman_Tipi" in features.columns:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        counts = features["Ekipman_Tipi"].value_counts().sort_values(ascending=False)
+        counts.plot(kind="bar", ax=ax)
+        ax.set_title("Ekipman Tipi Dağılımı")
+        ax.set_xlabel("Ekipman Tipi")
+        ax.set_ylabel("Ekipman Sayısı")
+        out_path = os.path.join(
+            PLOTS_ROOT_DIR, "plots_survival", "02_ekipman_tipi_dagilimi.png"
+        )
+        save_figure(fig, out_path, "Ekipman tipi dağılım grafiği")
+    else:
+        logger.warning("[WARN] 'Ekipman_Tipi' kolonu yok – ekipman tipi grafiği çizilemedi.")
+
+    # 3. MTBF dağılımı
+    if "MTBF_Gun" in features.columns:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        data = features["MTBF_Gun"].replace([np.inf, -np.inf], np.nan).dropna()
+        if len(data) > 0:
+            ax.hist(data, bins=40)
+            ax.set_title("MTBF Dağılımı")
+            ax.set_xlabel("MTBF (gün)")
+            ax.set_ylabel("Ekipman Sayısı")
+            out_path = os.path.join(
+                PLOTS_ROOT_DIR, "plots_chronic", "01_mtbf_dagilimi.png"
+            )
+            save_figure(fig, out_path, "MTBF dağılım grafiği")
+        else:
+            plt.close(fig)
+            logger.warning("[WARN] MTBF_Gun kolonunda geçerli değer yok – grafik atlandı.")
+    else:
+        logger.warning("[WARN] 'MTBF_Gun' kolonu yok – MTBF grafiği çizilemedi.")
+
+    # 4. Kronik flag dağılımı (Kronik_90g_Flag)
+    if "Kronik_90g_Flag" in features.columns:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        counts = features["Kronik_90g_Flag"].value_counts().sort_index()
+        counts.index = counts.index.map({0: "Kronik Değil", 1: "Kronik"})
+        counts.plot(kind="bar", ax=ax)
+        ax.set_title("Kronik (90g) Flag Dağılımı")
+        ax.set_xlabel("Durum")
+        ax.set_ylabel("Ekipman Sayısı")
+        out_path = os.path.join(
+            PLOTS_ROOT_DIR, "plots_chronic", "02_kronik_flag_dagilimi.png"
+        )
+        save_figure(fig, out_path, "Kronik flag dağılım grafiği")
+    else:
+        logger.warning("[WARN] 'Kronik_90g_Flag' kolonu yok – kronik grafiği çizilemedi.")
 
 
-# --------------------------------------------------------------------
-# 02 – Feature Engineering görselleri
-# --------------------------------------------------------------------
-def plot_mtbf_and_chronic():
-    feat_path = INTERMEDIATE_DIR / "features_pof3.csv"
-    if not feat_path.exists():
-        logger.warning(f"[WARN] features_pof3.csv bulunamadı: {feat_path}")
+# ----------------------------------------------------------------------
+# 2) Survival (KM) grafikleri
+# ----------------------------------------------------------------------
+def plot_km_curves(survival_base: pd.DataFrame):
+    if survival_base.empty:
+        logger.warning("[WARN] survival_base boş – KM eğrileri çizilemeyecek.")
         return
 
-    df = pd.read_csv(feat_path)
-
-    # MTBF dağılımı
-    if "MTBF_Gun" in df.columns:
-        plt.figure(figsize=(8, 5))
-        df["MTBF_Gun"].dropna().clip(upper=3650).plot.hist(bins=40)
-        plt.xlabel("MTBF (gün)")
-        plt.ylabel("Ekipman Sayısı")
-        plt.title("MTBF Dağılımı (3650 gün ile kırpılmış)")
-        out = VISUALS_DIR / "plots_chronic" / "01_mtbf_dagilimi.png"
-        plt.tight_layout()
-        plt.savefig(out, dpi=150)
-        plt.close()
-        logger.info(f"[OK] MTBF dağılım grafiği kaydedildi: {out}")
-
-    # Kronik flag oranı
-    kronik_cols = [c for c in df.columns if "Kronik" in c or "Chronic" in c]
-    if kronik_cols:
-        col = kronik_cols[0]
-        plt.figure(figsize=(5, 5))
-        df[col].fillna(0).astype(int).value_counts().sort_index().plot.bar()
-        plt.xlabel("Kronik Flag")
-        plt.ylabel("Ekipman Sayısı")
-        plt.title(f"Kronik Flag Dağılımı ({col})")
-        plt.xticks(ticks=[0, 1], labels=["0 - Normal", "1 - Kronik"])
-        out = VISUALS_DIR / "plots_chronic" / "02_kronik_flag_dagilimi.png"
-        plt.tight_layout()
-        plt.savefig(out, dpi=150)
-        plt.close()
-        logger.info(f"[OK] Kronik flag dağılım grafiği kaydedildi: {out}")
-
-
-# --------------------------------------------------------------------
-# 03 – Survival görselleri (Kaplan-Meier)
-# --------------------------------------------------------------------
-def plot_km_curves():
-    try:
-        from lifelines import KaplanMeierFitter
-    except ImportError:
-        logger.warning("[WARN] lifelines yüklü değil, Kaplan-Meier grafikleri atlanacak.")
+    required = {"duration_days", "event", "Ekipman_Tipi"}
+    missing = required - set(survival_base.columns)
+    if missing:
+        logger.warning(f"[WARN] KM için eksik kolon(lar): {missing} – KM atlanıyor.")
         return
 
-    surv_path = INTERMEDIATE_DIR / "survival_base.csv"
-    if not surv_path.exists():
-        logger.warning(f"[WARN] survival_base.csv bulunamadı: {surv_path}")
-        return
+    df = survival_base.copy()
+    df = df[df["duration_days"] > 0].copy()
 
-    df = pd.read_csv(surv_path)
-    required = ["Sure_Gun", "Olay"]
-    for col in required:
-        if col not in df.columns:
-            logger.warning(f"[WARN] survival_base içerisinde '{col}' kolonu yok; KM grafikleri atlanıyor.")
-            return
-
-    if "Ekipman_Tipi" not in df.columns:
-        logger.warning("[WARN] survival_base içerisinde 'Ekipman_Tipi' yok; tek KM eğrisi çizilecek.")
-        plt.figure(figsize=(8, 5))
-        kmf = KaplanMeierFitter()
-        kmf.fit(durations=df["Sure_Gun"], event_observed=df["Olay"])
-        kmf.plot()
-        plt.xlabel("Süre (gün)")
-        plt.ylabel("Sağkalım Olasılığı")
-        plt.title("Kaplan-Meier Eğrisi (Tüm Ekipmanlar)")
-        out = VISUALS_DIR / "plots_survival" / "03_km_tum_ekipmanlar.png"
-        plt.tight_layout()
-        plt.savefig(out, dpi=150)
-        plt.close()
-        logger.info(f"[OK] KM eğrisi kaydedildi: {out}")
-        return
-
-    # En çok gözlenen ilk 3 ekipman tipi
+    # En çok gözleme sahip 3 ekipman tipi
     top_types = (
         df["Ekipman_Tipi"].value_counts().head(3).index.tolist()
     )
+    if not top_types:
+        logger.warning("[WARN] KM için yeterli ekipman tipi yok.")
+        return
 
-    plt.figure(figsize=(9, 6))
     kmf = KaplanMeierFitter()
+    fig, ax = plt.subplots(figsize=(8, 6))
 
-    for etype in top_types:
-        sub = df[df["Ekipman_Tipi"] == etype]
-        if len(sub) < 30:
+    for eq_type in top_types:
+        sub = df[df["Ekipman_Tipi"] == eq_type]
+        if sub.empty:
             continue
-        kmf.fit(durations=sub["Sure_Gun"], event_observed=sub["Olay"], label=etype)
-        kmf.plot(ci_show=False)
+        kmf.fit(
+            durations=sub["duration_days"],
+            event_observed=sub["event"],
+            label=str(eq_type),
+        )
+        kmf.plot_survival_function(ax=ax)
 
-    plt.xlabel("Süre (gün)")
-    plt.ylabel("Sağkalım Olasılığı")
-    plt.title("Kaplan-Meier Eğrileri (En Büyük 3 Ekipman Tipi)")
-    out = VISUALS_DIR / "plots_survival" / "04_km_en_buyuk_3_tur.png"
-    plt.tight_layout()
-    plt.savefig(out, dpi=150)
-    plt.close()
-    logger.info(f"[OK] KM ekipman tipi grafiği kaydedildi: {out}")
+    ax.set_title("En Büyük 3 Ekipman Tipi İçin KM Sağkalım Eğrileri")
+    ax.set_xlabel("Süre (gün)")
+    ax.set_ylabel("Sağkalım Olasılığı")
+
+    out_path = os.path.join(
+        PLOTS_ROOT_DIR, "plots_survival", "04_km_en_buyuk_3_tur.png"
+    )
+    save_figure(fig, out_path, "KM ekipman tipi grafiği")
 
 
-# --------------------------------------------------------------------
-# 05 – Risk görselleri
-# --------------------------------------------------------------------
-def plot_risk_distribution():
-    risk_path = OUTPUT_DIR / "pof3_risk_table.csv"
-    if not risk_path.exists():
-        logger.warning(f"[WARN] pof3_risk_table.csv bulunamadı: {risk_path}")
+# ----------------------------------------------------------------------
+# 3) Risk tabanlı grafikler
+# ----------------------------------------------------------------------
+def plot_risk_charts(risk_df: pd.DataFrame):
+    if risk_df.empty:
+        logger.warning("[WARN] risk_skorlari veri seti boş – risk grafikleri atlanıyor.")
         return
 
-    df = pd.read_csv(risk_path)
-    if "Risk_Skoru" not in df.columns:
-        logger.warning("[WARN] Risk_Skoru kolonu bulunamadı; risk görselleri atlanıyor.")
-        return
+    # 1. Risk skoru dağılımı
+    if "Risk_Skoru" in risk_df.columns:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        data = risk_df["Risk_Skoru"].replace([np.inf, -np.inf], np.nan).dropna()
+        ax.hist(data, bins=40)
+        ax.set_title("Risk Skoru Dağılımı")
+        ax.set_xlabel("Risk Skoru (PoF * CoF)")
+        ax.set_ylabel("Ekipman Sayısı")
+        out_path = os.path.join(
+            PLOTS_ROOT_DIR, "plots_risk", "01_risk_skoru_dagilimi.png"
+        )
+        save_figure(fig, out_path, "Risk skoru dağılım grafiği")
+    else:
+        logger.warning("[WARN] 'Risk_Skoru' kolonu yok – risk skoru grafiği çizilemedi.")
 
-    # Risk_Skoru histogramı
-    plt.figure(figsize=(8, 5))
-    df["Risk_Skoru"].dropna().clip(upper=df["Risk_Skoru"].quantile(0.99)).plot.hist(bins=40)
-    plt.xlabel("Risk Skoru (PoF * CoF)")
-    plt.ylabel("Ekipman Sayısı")
-    plt.title("Risk Skoru Dağılımı (99. persentil ile kırpılmış)")
-    out = VISUALS_DIR / "plots_risk" / "01_risk_skoru_dagilimi.png"
-    plt.tight_layout()
-    plt.savefig(out, dpi=150)
-    plt.close()
-    logger.info(f"[OK] Risk skoru dağılım grafiği kaydedildi: {out}")
-
-    # Risk sınıfı bar chart
-    if "Risk_Sinifi" in df.columns:
-        plt.figure(figsize=(6, 5))
-        df["Risk_Sinifi"].value_counts().reindex(["DÜŞÜK", "ORTA", "YÜKSEK", "BİLİNMİYOR"]).plot.bar()
-        plt.xlabel("Risk Sınıfı")
-        plt.ylabel("Ekipman Sayısı")
-        plt.title("Risk Sınıfı Dağılımı")
-        out = VISUALS_DIR / "plots_risk" / "02_risk_sinifi_dagilimi.png"
-        plt.tight_layout()
-        plt.savefig(out, dpi=150)
-        plt.close()
-        logger.info(f"[OK] Risk sınıfı dağılım grafiği kaydedildi: {out}")
+    # 2. Risk sınıfı dağılımı
+    if "Risk_Sinifi" in risk_df.columns:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        counts = risk_df["Risk_Sinifi"].value_counts().reindex(
+            ["Düşük", "Orta", "Yüksek", "Çok Yüksek"]
+        )
+        counts = counts.fillna(0)
+        counts.plot(kind="bar", ax=ax)
+        ax.set_title("Risk Sınıfı Dağılımı")
+        ax.set_xlabel("Risk Sınıfı")
+        ax.set_ylabel("Ekipman Sayısı")
+        out_path = os.path.join(
+            PLOTS_ROOT_DIR, "plots_risk", "02_risk_sinifi_dagilimi.png"
+        )
+        save_figure(fig, out_path, "Risk sınıfı dağılım grafiği")
+    else:
+        logger.warning("[WARN] 'Risk_Sinifi' kolonu yok – risk sınıfı grafiği çizilemedi.")
 
 
+# ----------------------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------------------
 def main():
-    logger.info("=" * 80)
-    logger.info("06_visualizations - PoF3 Görselleştirme Modülü")
-    logger.info("=" * 80)
+    # 1) Özellik seti
+    features = safe_read_csv(FEATURE_OUTPUT_PATH, "Özellik seti (ozellikler_pof3)")
 
-    try:
-        plot_age_and_type_distributions()
-        plot_mtbf_and_chronic()
-        plot_km_curves()
-        plot_risk_distribution()
-        logger.info("[SUCCESS] 06_visualizations başarıyla tamamlandı.")
-    except Exception as e:
-        logger.exception(f"[FATAL] 06_visualizations hata ile sonlandı: {e}")
-        raise
+    # 2) Survival base
+    survival_path = INTERMEDIATE_PATHS.get(
+        "survival_base", os.path.join("data", "ara_ciktilar", "survival_base.csv")
+    )
+    survival_base = safe_read_csv(survival_path, "survival_base")
+
+    # 3) Risk skorları
+    risk_path = os.path.join(OUTPUT_DIR, "risk_skorlari.csv")
+    risk_df = safe_read_csv(risk_path, "risk_skorlari")
+
+    logger.info("")
+    logger.info("[STEP] Özellik tabanlı grafikler üretiliyor...")
+    plot_feature_based_charts(features)
+
+    logger.info("[STEP] Survival (KM) grafikleri üretiliyor...")
+    plot_km_curves(survival_base)
+
+    logger.info("[STEP] Risk tabanlı grafikler üretiliyor...")
+    plot_risk_charts(risk_df)
+
+    logger.info("[SUCCESS] 06_gorsellestirmeler başarıyla tamamlandı.")
+    logger.info("=" * 80)
 
 
 if __name__ == "__main__":

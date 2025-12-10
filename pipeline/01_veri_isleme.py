@@ -27,6 +27,11 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+# Ensure project root in path
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 # UTF-8 güvenli çıktı
 try:
@@ -460,6 +465,51 @@ def main():
     try:
         df_fault = load_fault_data(logger)
         df_healthy = load_healthy_data(logger)
+
+        # ---------------------------------------------------------
+        # DATA_START_DATE and DATA_END_DATE Auto-Detection
+        # ---------------------------------------------------------
+        logger.info("")
+        logger.info("[DATA RANGE DETECTION] Detecting temporal boundaries from fault data...")
+
+        DATA_START_DATE = df_fault["started at"].min()
+        DATA_END_DATE = df_fault["started at"].max()
+        data_span_days = (DATA_END_DATE - DATA_START_DATE).days
+        data_span_years = data_span_days / 365.25
+
+        logger.info(f"[DATA RANGE] DATA_START_DATE = {DATA_START_DATE.date()}")
+        logger.info(f"[DATA RANGE] DATA_END_DATE   = {DATA_END_DATE.date()}")
+        logger.info(f"[DATA RANGE] Data span       = {data_span_years:.2f} years ({data_span_days:,} days)")
+        logger.info("")
+
+        # Validation: Minimum 2 years required for ML training
+        MIN_REQUIRED_YEARS = 2.0
+        if data_span_years < MIN_REQUIRED_YEARS:
+            logger.error(f"[FATAL] Insufficient data span: {data_span_years:.2f} years < {MIN_REQUIRED_YEARS} years")
+            logger.error("[FATAL] At least 2 years of fault data required for reliable PoF models")
+            raise ValueError(f"Insufficient data: {data_span_years:.2f} years < {MIN_REQUIRED_YEARS} years required")
+
+        logger.info(f"[OK] Data span validation passed: {data_span_years:.2f} years >= {MIN_REQUIRED_YEARS} years")
+
+        # Save metadata for Step 03
+        metadata = pd.DataFrame({
+            "Parameter": ["DATA_START_DATE", "DATA_END_DATE", "DATA_SPAN_DAYS", "DATA_SPAN_YEARS"],
+            "Value": [
+                DATA_START_DATE.strftime("%Y-%m-%d"),
+                DATA_END_DATE.strftime("%Y-%m-%d"),
+                str(data_span_days),
+                f"{data_span_years:.2f}"
+            ]
+        })
+
+        metadata_path = os.path.join(
+            os.path.dirname(INTERMEDIATE_PATHS["fault_events_clean"]),
+            "data_range_metadata.csv"
+        )
+        metadata.to_csv(metadata_path, index=False, encoding="utf-8-sig")
+        logger.info(f"[INFO] Data range metadata saved → {metadata_path}")
+        logger.info("")
+        # ---------------------------------------------------------
 
         fault_events = build_fault_events(df_fault)
         equipment_master = build_equipment_master(df_fault, df_healthy, logger)
