@@ -420,8 +420,8 @@ def build_equipment_master(df_fault: pd.DataFrame,
     rare = counts[counts < MIN_EQUIPMENT_PER_CLASS].index.tolist()
 
     if rare:
-        logger.info(f"[INFO] Nadir ekipman sınıfları 'Other' altına alındı: {rare}")
-        all_eq.loc[all_eq["Ekipman_Tipi"].isin(rare), "Ekipman_Tipi"] = "Other"
+        logger.info(f"[INFO] Nadir ekipman sınıfları 'Diger' altına alındı: {rare}")
+        all_eq.loc[all_eq["Ekipman_Tipi"].isin(rare), "Ekipman_Tipi"] = "Diger"
 
     return all_eq
 
