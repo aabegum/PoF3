@@ -34,32 +34,53 @@ Model dosyaları (iç kullanım):
     <proje_koku>/modeller/pof_ml_catboost.cbm
 """
 
+# ----------------------------------------------------------------------
+# Standard library imports
+# ----------------------------------------------------------------------
 import os
 import sys
 import logging
-from datetime import datetime
+import warnings
+from datetime import datetime, timedelta
 
+# ----------------------------------------------------------------------
+# Third-party imports
+# ----------------------------------------------------------------------
 import numpy as np
 import pandas as pd
 
 # ----------------------------------------------------------------------
-# Proje kökü ve UTF-8 konsol
+# Project root setup
 # ----------------------------------------------------------------------
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+# UTF-8 console
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
-import warnings
 warnings.filterwarnings("ignore")
 
 # ----------------------------------------------------------------------
-# Opsiyonel ML kütüphaneleri
+# Project imports
 # ----------------------------------------------------------------------
+from utils.date_parser import parse_date_safely
+
+# Cox PH
+from lifelines import CoxPHFitter
+
+# RSF (optional)
+try:
+    from sksurv.ensemble import RandomSurvivalForest
+    from sksurv.util import Surv
+    HAS_RSF = True
+except Exception:
+    HAS_RSF = False
+
+# ML libraries (optional)
 try:
     import xgboost as xgb
     from catboost import CatBoostClassifier
@@ -69,39 +90,40 @@ try:
 except Exception:
     HAS_ML = False
 
-# Cox PH
-from lifelines import CoxPHFitter
-
-# RSF (opsiyonel)
-try:
-    from sksurv.ensemble import RandomSurvivalForest
-    from sksurv.util import Surv
-    HAS_RSF = True
-except Exception:
-    HAS_RSF = False
-
 # ----------------------------------------------------------------------
-# CONFIG
+# Config
 # ----------------------------------------------------------------------
 try:
     from config.config import (
+        ANALYSIS_DATE,
         INTERMEDIATE_PATHS,
         FEATURE_OUTPUT_PATH,
         OUTPUT_DIR,
+        RESULT_PATHS,
+        SURVIVAL_HORIZONS,
         SURVIVAL_HORIZONS_MONTHS,
+        ML_REF_DAYS_BEFORE_ANALYSIS,
+        ML_PREDICTION_WINDOW_DAYS,
         MIN_EQUIPMENT_PER_CLASS,
         RANDOM_STATE,
         LOG_DIR,
     )
-except Exception:
-    # Fallback (çok gerekirse)
+except ImportError:
+    # Fallback defaults
     DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+    ANALYSIS_DATE = pd.Timestamp.today().normalize()
     INTERMEDIATE_PATHS = {
         "survival_base": os.path.join(DATA_DIR, "ara_ciktilar", "survival_base.csv"),
+        "fault_events_clean": os.path.join(DATA_DIR, "ara_ciktilar", "fault_events_clean.csv"),
+        "equipment_master": os.path.join(DATA_DIR, "ara_ciktilar", "equipment_master.csv"),
     }
     FEATURE_OUTPUT_PATH = os.path.join(DATA_DIR, "ara_ciktilar", "ozellikler_pof3.csv")
     OUTPUT_DIR = os.path.join(DATA_DIR, "sonuclar")
+    RESULT_PATHS = {"POF": os.path.join(DATA_DIR, "sonuclar")}
+    SURVIVAL_HORIZONS = [3, 6, 12, 24]
     SURVIVAL_HORIZONS_MONTHS = [3, 6, 12]
+    ML_REF_DAYS_BEFORE_ANALYSIS = 365
+    ML_PREDICTION_WINDOW_DAYS = 365
     MIN_EQUIPMENT_PER_CLASS = 30
     RANDOM_STATE = 42
     LOG_DIR = os.path.join(PROJECT_ROOT, "loglar")
@@ -251,7 +273,15 @@ def prepare_cox_data(df_full: pd.DataFrame, logger: logging.Logger) -> pd.DataFr
 
     maintenance_features = [
         "Bakim_Sayisi",
+        "Bakim_Var_Mi",  # Binary indicator: has maintenance record
         "Son_Bakimdan_Gecen_Gun",
+    ]
+
+    chronic_features = [
+        "Kronik_Kritik",  # Multi-level chronic flags
+        "Kronik_Yuksek",
+        "Kronik_Orta",
+        "Kronik_Gozlem",
     ]
 
     equipment_features = [
@@ -274,7 +304,7 @@ def prepare_cox_data(df_full: pd.DataFrame, logger: logging.Logger) -> pd.DataFr
         except Exception:
             logger.warning("[WARN] Gerilim_Seviyesi sayısallaştırılamadı, Cox'ta kullanılmayacak.")
 
-    candidate_features = base_features + maintenance_features + equipment_features
+    candidate_features = base_features + maintenance_features + chronic_features + equipment_features
 
     feature_cols = ["Ekipman_Tipi"] + [c for c in candidate_features if c in df.columns]
 
@@ -283,22 +313,32 @@ def prepare_cox_data(df_full: pd.DataFrame, logger: logging.Logger) -> pd.DataFr
     df = df[required_cols].copy()
 
     # Sayısal özelliklerde NaN → median (veya 0 eğer median de NaN ise)
+    # SPECIAL HANDLING: Maintenance features should NOT use median imputation
     numeric_cols = [
         c
         for c in df.columns
         if c not in ["Ekipman_Tipi", "cbs_id"]
         and pd.api.types.is_numeric_dtype(df[c])
     ]
+
+    # Maintenance columns: never maintained ≠ maintained at median time
+    maintenance_cols = ["Son_Bakimdan_Gecen_Gun", "Ilk_Bakim_Tarihi"]
+
     for col in numeric_cols:
         if df[col].isna().any():
-            med = df[col].median()
-            # Eğer median de NaN ise (tüm değerler NaN), 0 kullan
-            if pd.isna(med):
-                df[col] = df[col].fillna(0)
-                logger.info(f"[INFO] {col} kolonundaki NaN değerler 0 ile dolduruldu (median bulunamadı).")
+            # Special handling for maintenance features
+            if any(m in col for m in maintenance_cols):
+                df[col] = df[col].fillna(9999)  # Sentinel: never maintained
+                logger.info(f"[INFO] {col} kolonundaki NaN değerler 9999 ile dolduruldu (hiç bakım yapılmamış).")
             else:
-                df[col] = df[col].fillna(med)
-                logger.info(f"[INFO] {col} kolonundaki NaN değerler median={med:.2f} ile dolduruldu.")
+                med = df[col].median()
+                # Eğer median de NaN ise (tüm değerler NaN), 0 kullan
+                if pd.isna(med):
+                    df[col] = df[col].fillna(0)
+                    logger.info(f"[INFO] {col} kolonundaki NaN değerler 0 ile dolduruldu (median bulunamadı).")
+                else:
+                    df[col] = df[col].fillna(med)
+                    logger.info(f"[INFO] {col} kolonundaki NaN değerler median={med:.2f} ile dolduruldu.")
 
     # cbs_id yedeği
     cbs_ids = df[["cbs_id"]].copy()
@@ -423,6 +463,27 @@ def fit_rsf_model(df_cox: pd.DataFrame, logger: logging.Logger):
         )
         rsf.fit(X, y)
         logger.info("[OK] RSF modeli başarıyla eğitildi.")
+
+        # Feature importance
+        logger.info("[RSF] Feature importance hesaplanıyor...")
+        try:
+            importance = rsf.feature_importances_
+            importance_df = pd.DataFrame({
+                "feature": X.columns,
+                "importance": importance
+            }).sort_values("importance", ascending=False)
+
+            logger.info("[RSF] Top 10 önemli özellikler:")
+            for _, row in importance_df.head(10).iterrows():
+                logger.info(f"  {row['feature']:30s}: {row['importance']:.4f}")
+
+            # Save importance
+            importance_path = os.path.join(RESULT_PATHS["POF"], "rsf_feature_importance.csv")
+            importance_df.to_csv(importance_path, index=False, encoding="utf-8-sig")
+            logger.info(f"[RSF] Feature importance kaydedildi → {importance_path}")
+        except Exception as e:
+            logger.warning(f"[WARN] RSF feature importance hesaplanamadı: {e}")
+
         return rsf
     except Exception as e:
         logger.exception(f"[FATAL] RSF modeli eğitimi başarısız: {e}")
@@ -468,163 +529,321 @@ def compute_pof_from_rsf(
 
 
 # ----------------------------------------------------------------------
-# ML tabanlı statik PoF (XGBoost + CatBoost)
+# ML tabanlı Leakage-Free PoF (XGBoost + CatBoost)
 # ----------------------------------------------------------------------
-def train_ml_pof_models(df_full: pd.DataFrame, logger: logging.Logger) -> None:
-    """
-    ML tabanlı PoF modeli (XGBoost + CatBoost).
+def build_leakage_free_ml_dataset(logger):
+    logger.info("")
+    logger.info("[ML] Leakage-free veri seti oluşturuluyor...")
 
-    Hedef: event (0/1) → ekipman bugüne kadar en az bir kez arıza yapmış mı?
-    - Zaman ufkuna bağlı olmayan "statik arıza eğilimi" skoru üretir.
-    - Sağkalım modellerini tamamlayıcı olarak kullanılır.
-    """
-    if not HAS_ML:
-        logger.warning(
-            "[WARN] XGBoost/CatBoost bulunamadı, ML PoF modeli atlanıyor. "
-            "pip install xgboost catboost komutlarını kontrol edin."
-        )
-        return
+    # ---------------------------------------------------------
+    # Load DATA_END_DATE from Step 01 metadata
+    # ---------------------------------------------------------
+    metadata_path = os.path.join(
+        os.path.dirname(INTERMEDIATE_PATHS["fault_events_clean"]),
+        "data_range_metadata.csv"
+    )
 
-    if "event" not in df_full.columns:
-        logger.warning("[WARN] ML PoF modeli için 'event' kolonu zorunlu. ML adımı atlanıyor.")
-        return
+    if not os.path.exists(metadata_path):
+        logger.warning(f"[WARN] Data range metadata not found: {metadata_path}")
+        logger.warning("[WARN] Falling back to ANALYSIS_DATE from config")
+        analysis_dt = pd.to_datetime(ANALYSIS_DATE)
+    else:
+        metadata = pd.read_csv(metadata_path, encoding="utf-8-sig")
+        DATA_END_DATE_str = metadata.loc[metadata["Parameter"] == "DATA_END_DATE", "Value"].iloc[0]
+        DATA_END_DATE = pd.to_datetime(DATA_END_DATE_str)
+        DATA_START_DATE_str = metadata.loc[metadata["Parameter"] == "DATA_START_DATE", "Value"].iloc[0]
+        DATA_START_DATE = pd.to_datetime(DATA_START_DATE_str)
+
+        logger.info(f"[ML] DATA_START_DATE (detected) = {DATA_START_DATE.date()}")
+        logger.info(f"[ML] DATA_END_DATE (detected)   = {DATA_END_DATE.date()}")
+
+        analysis_dt = DATA_END_DATE
+
+    # ---------------------------------------------------------
+    # Calculate valid T_ref
+    # ---------------------------------------------------------
+    # T_ref should be positioned such that:
+    # 1. We have at least 2 years of training data before T_ref
+    # 2. We have 12 months of prediction window that doesn't exceed DATA_END_DATE
+    #
+    # Therefore: T_ref = DATA_END_DATE - 12 months (365 days)
+
+    ref_date = analysis_dt - timedelta(days=ML_PREDICTION_WINDOW_DAYS)
+    window_end = ref_date + timedelta(days=ML_PREDICTION_WINDOW_DAYS)
 
     logger.info("")
-    logger.info("[STEP] ML tabanlı statik PoF modelleri (XGBoost + CatBoost) eğitiliyor")
+    logger.info(f"[ML] Referans tarih (T_ref) = {ref_date.date()}")
+    logger.info(f"[ML] Tahmin penceresi = {ref_date.date()} → {window_end.date()}")
 
-    data = df_full.copy()
+    # Validation check
+    if os.path.exists(metadata_path):
+        training_span_days = (ref_date - DATA_START_DATE).days
+        training_span_years = training_span_days / 365.25
 
-    y = data["event"].astype(int)
-    if y.nunique() < 2:
-        logger.warning("[WARN] event tek sınıflı, ML modeli eğitilmeyecek.")
-        return
+        logger.info(f"[ML] Training data span = {training_span_years:.2f} years ({training_span_days:,} days)")
 
+        MIN_TRAIN_YEARS = 2.0
+        if training_span_years < MIN_TRAIN_YEARS:
+            logger.error(f"[FATAL] Insufficient training data: {training_span_years:.2f} years < {MIN_TRAIN_YEARS} years")
+            logger.error(f"[FATAL] T_ref = {ref_date.date()} leaves insufficient historical data")
+            raise ValueError(f"Insufficient training data: {training_span_years:.2f} years")
+
+        logger.info(f"[OK] Training data validation passed: {training_span_years:.2f} years >= {MIN_TRAIN_YEARS} years")
+        logger.info("")
+
+    # ----------------------------------------------
+    # 1) Load input sources
+    # ----------------------------------------------
+    events = pd.read_csv(INTERMEDIATE_PATHS["fault_events_clean"], encoding="utf-8-sig")
+    eq = pd.read_csv(INTERMEDIATE_PATHS["equipment_master"], encoding="utf-8-sig")
+
+    events.rename(columns={"CBS_ID": "cbs_id"}, inplace=True)
+    eq.rename(columns={"CBS_ID": "cbs_id"}, inplace=True)
+
+    events["Ariza_Baslangic_Zamani"] = events["Ariza_Baslangic_Zamani"].apply(parse_date_safely)
+    eq["Kurulum_Tarihi"] = eq["Kurulum_Tarihi"].apply(parse_date_safely)
+
+    events["cbs_id"] = events["cbs_id"].astype(str).str.lower().str.strip()
+    eq["cbs_id"] = eq["cbs_id"].astype(str).str.lower().str.strip()
+
+    # ----------------------------------------------
+    # 2) Split past & future faults
+    # ----------------------------------------------
+    past = events[events["Ariza_Baslangic_Zamani"] <= ref_date].copy()
+    future = events[
+        (events["Ariza_Baslangic_Zamani"] > ref_date)
+        & (events["Ariza_Baslangic_Zamani"] <= window_end)
+    ].copy()
+
+    logger.info(f"[ML] Geçmiş arıza sayısı: {len(past):,}")
+    logger.info(f"[ML] Pencere içi arıza sayısı: {len(future):,}")
+
+    # ----------------------------------------------
+    # 3) Build past-features
+    # ----------------------------------------------
+    rows = []
+    for cid, grp in past.groupby("cbs_id"):
+        times = grp["Ariza_Baslangic_Zamani"].dropna().sort_values().values
+        cnt = len(times)
+
+        if cnt < 2:
+            mtbf = np.nan
+        else:
+            diffs = np.diff(times).astype("timedelta64[D]").astype(int)
+            mtbf = float(np.mean(diffs))
+
+        last = times[-1] if cnt > 0 else None
+        days_since_last = (ref_date - last).days if last is not None else np.nan
+
+        rows.append((cid, cnt, mtbf, days_since_last))
+
+    past_feat = pd.DataFrame(
+        rows,
+        columns=[
+            "cbs_id",
+            "Ariza_Sayisi_Gecmis",
+            "MTBF_Gun_Gecmis",
+            "Son_Ariza_Gun_Sayisi_Gecmis",
+        ]
+    )
+
+    # ----------------------------------------------
+    # 4) Build labels (future window)
+    # ----------------------------------------------
+    if future.empty:
+        target = pd.DataFrame({"cbs_id": eq["cbs_id"], "Label_Ariza_Pencere": 0})
+    else:
+        tmp = future.groupby("cbs_id").size().rename("Label_Ariza_Pencere").reset_index()
+        tmp["Label_Ariza_Pencere"] = 1
+        target = tmp
+
+    # ----------------------------------------------
+    # 5) Base equipment snapshot at T_ref
+    # ----------------------------------------------
+    base = eq.copy()
+    base = base[base["Kurulum_Tarihi"] <= ref_date].copy()
+
+    base["Ekipman_Yasi_Gun_ML"] = (ref_date - base["Kurulum_Tarihi"]).dt.days.clip(lower=0)
+
+    if "Gerilim_Seviyesi" not in eq.columns:
+        base["Gerilim_Seviyesi"] = "UNKNOWN"
+    if "Marka" not in eq.columns:
+        base["Marka"] = "UNKNOWN"
+
+    # ----------------------------------------------
+    # 6) Merge everything
+    # ----------------------------------------------
+    df = (
+        base[["cbs_id", "Ekipman_Tipi", "Gerilim_Seviyesi", "Marka", "Ekipman_Yasi_Gun_ML"]]
+        .merge(past_feat, on="cbs_id", how="left")
+        .merge(target, on="cbs_id", how="left")
+    )
+
+    df["Label_Ariza_Pencere"] = df["Label_Ariza_Pencere"].fillna(0).astype(int)
+    df["Ariza_Sayisi_Gecmis"] = df["Ariza_Sayisi_Gecmis"].fillna(0).astype(int)
+    df["MTBF_Gun_Gecmis"] = df["MTBF_Gun_Gecmis"].fillna(df["MTBF_Gun_Gecmis"].median())
+    df["Son_Ariza_Gun_Sayisi_Gecmis"] = df["Son_Ariza_Gun_Sayisi_Gecmis"].fillna(
+        df["Ekipman_Yasi_Gun_ML"]
+    )
+
+    logger.info(f"[ML] ML veri seti: {len(df):,} ekipman")
+    logger.info(f"[ML] Pozitif label sayısı: {df['Label_Ariza_Pencere'].sum():,}")
+
+    return df
+def train_leakage_free_ml_models(df, logger):
+    logger.info("")
+    logger.info("[STEP] Leakage-free ML PoF modeli eğitiliyor (XGBoost + CatBoost)")
+
+    y = df["Label_Ariza_Pencere"]
     id_col = "cbs_id"
-    drop_cols = {id_col, "event", "duration_days"}
 
-    # Kategorik özellikler (native CatBoost için)
-    cat_cols = []
-    for cand in ["Ekipman_Tipi", "Gerilim_Seviyesi", "Marka"]:
-        if cand in data.columns:
-            cat_cols.append(cand)
-
-    # Sayısal özellikler (kategorik olanları hariç tut)
+    # Separate inputs
     numeric_cols = [
-        c
-        for c in data.columns
-        if c not in drop_cols
-        and c not in cat_cols
-        and pd.api.types.is_numeric_dtype(data[c])
+        "Ekipman_Yasi_Gun_ML",
+        "Ariza_Sayisi_Gecmis",
+        "MTBF_Gun_Gecmis",
+        "Son_Ariza_Gun_Sayisi_Gecmis",
     ]
+    cat_cols = ["Ekipman_Tipi", "Gerilim_Seviyesi", "Marka"]
 
-    logger.info(f"[INFO] ML - sayısal özellikler: {numeric_cols}")
-    logger.info(f"[INFO] ML - kategorik özellikler: {cat_cols}")
+    # Add binary/ordinal features if available
+    binary_cols = []
+    if "Bakim_Var_Mi" in df.columns:
+        binary_cols.append("Bakim_Var_Mi")
+    if "Kronik_90g_Flag" in df.columns:
+        binary_cols.append("Kronik_90g_Flag")
 
-    # XGBoost: sayısal + one-hot kategorik
-    X_xgb = data[numeric_cols].copy()
-    if cat_cols:
-        # Her kategorik kolonu tek tek get_dummies ile işle
-        for col in cat_cols:
-            dummies = pd.get_dummies(data[[col]], drop_first=True, prefix=col)
-            X_xgb = pd.concat([X_xgb, dummies], axis=1)
+    # Combine all features
+    all_feature_cols = numeric_cols + binary_cols + cat_cols
 
-    # CatBoost: sayısal + kategorik direkt
-    feature_cols_cat = numeric_cols + cat_cols
-    X_cat = data[feature_cols_cat].copy()
+    X_num = df[numeric_cols].copy()
+    X_bin = df[binary_cols].copy() if binary_cols else pd.DataFrame(index=df.index)
+    X_cat = df[cat_cols].astype(str)
 
-    # CatBoost için kategorik kolonları string'e çevir
-    for col in cat_cols:
-        if col in X_cat.columns:
-            X_cat[col] = X_cat[col].astype(str)
+    # XGBoost: numerical + binary + one-hot categorical
+    X_xgb = pd.concat([X_num, X_bin, pd.get_dummies(X_cat, drop_first=True)], axis=1)
 
-    cat_indices = [feature_cols_cat.index(c) for c in cat_cols]
+    # CatBoost: numerical + binary + categorical
+    X_catb = pd.concat([X_num, X_bin, X_cat], axis=1)
+    cat_idx = [X_catb.columns.get_loc(c) for c in cat_cols]
 
-    X_xgb_train, X_xgb_test, y_train, y_test = train_test_split(
-        X_xgb,
-        y,
-        test_size=0.3,
-        random_state=RANDOM_STATE,
-        stratify=y,
-    )
-    X_cat_train, X_cat_test, _, _ = train_test_split(
-        X_cat,
-        y,
-        test_size=0.3,
-        random_state=RANDOM_STATE,
-        stratify=y,
+    from sklearn.model_selection import train_test_split
+    X_train_xgb, X_test_xgb, y_train, y_test = train_test_split(
+        X_xgb, y, test_size=0.3, random_state=RANDOM_STATE, stratify=y
     )
 
-    # -------------------- XGBoost --------------------
-    logger.info("[STEP] XGBoost PoF modelini eğitme")
-    xgb_model = xgb.XGBClassifier(
-        n_estimators=200,
-        max_depth=3,
+    X_train_cat, X_test_cat, _, _ = train_test_split(
+        X_catb, y, test_size=0.3, random_state=RANDOM_STATE, stratify=y
+    )
+
+    # ------------------- XGBoost -------------------
+    logger.info("[ML] XGBoost eğitiliyor...")
+    model_xgb = xgb.XGBClassifier(
+        n_estimators=300,
+        max_depth=4,
         learning_rate=0.05,
         subsample=0.8,
         colsample_bytree=0.8,
-        reg_alpha=0.0,
-        reg_lambda=1.0,
-        objective="binary:logistic",
-        eval_metric="logloss",
         random_state=RANDOM_STATE,
-        n_jobs=-1,
+        eval_metric="logloss",
     )
+    model_xgb.fit(X_train_xgb, y_train)
 
-    xgb_model.fit(X_xgb_train, y_train)
-    y_proba_test = xgb_model.predict_proba(X_xgb_test)[:, 1]
-    auc_xgb = roc_auc_score(y_test, y_proba_test)
-    ap_xgb = average_precision_score(y_test, y_proba_test)
-    logger.info(f"[OK] XGBoost test AUC: {auc_xgb:.3f}, AP: {ap_xgb:.3f}")
+    proba_xgb = model_xgb.predict_proba(X_test_xgb)[:, 1]
+    auc_xgb = roc_auc_score(y_test, proba_xgb)
+    ap_xgb = average_precision_score(y_test, proba_xgb)
 
-    xgb_proba_all = xgb_model.predict_proba(X_xgb)[:, 1]
+    logger.info(f"[ML] XGBoost AUC={auc_xgb:.3f}, AP={ap_xgb:.3f}")
 
-    # -------------------- CatBoost --------------------
-    logger.info("[STEP] CatBoost PoF modelini eğitme")
-    cat_model = CatBoostClassifier(
-        iterations=200,
+    # ------------------- CatBoost -------------------
+    logger.info("[ML] CatBoost eğitiliyor...")
+    model_cat = CatBoostClassifier(
+        iterations=400,
         depth=4,
         learning_rate=0.05,
-        l2_leaf_reg=3.0,
-        loss_function="Logloss",
         eval_metric="AUC",
-        verbose=False,
+        loss_function="Logloss",
         random_state=RANDOM_STATE,
-    )
-
-    cat_model.fit(
-        X_cat_train,
-        y_train,
-        cat_features=cat_indices,
-        eval_set=(X_cat_test, y_test),
         verbose=False,
     )
-    y_proba_cat_test = cat_model.predict_proba(X_cat_test)[:, 1]
-    auc_cat = roc_auc_score(y_test, y_proba_cat_test)
-    ap_cat = average_precision_score(y_test, y_proba_cat_test)
-    logger.info(f"[OK] CatBoost test AUC: {auc_cat:.3f}, AP: {ap_cat:.3f}")
-
-    cat_proba_all = cat_model.predict_proba(X_cat)[:, 1]
-
-    # -------------------- Çıktıları kaydet --------------------
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    out_df = pd.DataFrame(
-        {
-            id_col: data[id_col].values,
-            "PoF_ML_XGB": xgb_proba_all,
-            "PoF_ML_CatBoost": cat_proba_all,
-        }
+    model_cat.fit(
+        X_train_cat,
+        y_train,
+        cat_features=cat_idx,
+        eval_set=(X_test_cat, y_test),
+        verbose=False,
     )
-    out_path = os.path.join(OUTPUT_DIR, "statik_ariza_egilim_skoru.csv")
+
+    proba_cat = model_cat.predict_proba(X_test_cat)[:, 1]
+    auc_cat = roc_auc_score(y_test, proba_cat)
+    ap_cat = average_precision_score(y_test, proba_cat)
+
+    logger.info(f"[ML] CatBoost AUC={auc_cat:.3f}, AP={ap_cat:.3f}")
+
+    # ------------------- Advanced Features -------------------
+    RESULTS = RESULT_PATHS["POF"]
+    os.makedirs(RESULTS, exist_ok=True)
+
+    # 1. Temporal Cross-Validation
+    logger.info("")
+    logger.info("[ADVANCED] Running temporal cross-validation...")
+    try:
+        from utils.ml_advanced import temporal_cross_validation
+
+        cv_results = temporal_cross_validation(
+            X=X_xgb,
+            y=y,
+            model_fn=lambda: xgb.XGBClassifier(
+                n_estimators=300, max_depth=4, learning_rate=0.05,
+                subsample=0.8, colsample_bytree=0.8, random_state=RANDOM_STATE, eval_metric="logloss"
+            ),
+            n_splits=3,
+            logger=logger
+        )
+
+        # Save CV results
+        cv_df = pd.DataFrame({
+            "metric": ["AUC"] * 3 + ["AP"] * 3,
+            "fold": [1, 2, 3, 1, 2, 3],
+            "score": cv_results["auc_scores"] + cv_results["ap_scores"]
+        })
+        cv_path = os.path.join(RESULTS, "temporal_cv_scores.csv")
+        cv_df.to_csv(cv_path, index=False, encoding="utf-8-sig")
+        logger.info(f"[ADVANCED] Temporal CV scores saved → {cv_path}")
+    except Exception as e:
+        logger.warning(f"[WARN] Temporal CV failed: {e}")
+
+    # 2. SHAP Feature Importance
+    logger.info("")
+    logger.info("[ADVANCED] Computing SHAP feature importance...")
+    try:
+        from utils.ml_advanced import compute_shap_importance
+
+        shap_df = compute_shap_importance(model_xgb, X_xgb, max_samples=1000, logger=logger)
+        if not shap_df.empty:
+            shap_path = os.path.join(RESULTS, "shap_feature_importance.csv")
+            shap_df.to_csv(shap_path, index=False, encoding="utf-8-sig")
+            logger.info(f"[ADVANCED] SHAP importance saved → {shap_path}")
+    except Exception as e:
+        logger.warning(f"[WARN] SHAP computation failed: {e}")
+
+    # ------------------- Save full-model outputs -------------------
+    out_df = pd.DataFrame({
+        "cbs_id": df["cbs_id"],
+        "PoF_ML_XGB": model_xgb.predict_proba(X_xgb)[:, 1],
+        "PoF_ML_CatBoost": model_cat.predict_proba(X_catb)[:, 1],
+    })
+    out_path = os.path.join(RESULTS, "leakage_free_ml_pof.csv")
     out_df.to_csv(out_path, index=False, encoding="utf-8-sig")
-    logger.info(f"[OK] Statik arıza eğilimi skorları kaydedildi: {out_path}")
 
-    # Model dosyaları
+    logger.info(f"[ML] Leakage-free ML PoF skorları kaydedildi → {out_path}")
+
+    # Save models
     os.makedirs(MODELS_DIR, exist_ok=True)
-    xgb_model.save_model(os.path.join(MODELS_DIR, "pof_ml_xgb.json"))
-    cat_model.save_model(os.path.join(MODELS_DIR, "pof_ml_catboost.cbm"))
-    logger.info(f"[OK] ML modelleri kaydedildi → {MODELS_DIR}")
+    model_xgb.save_model(os.path.join(MODELS_DIR, "leakage_free_pof_xgb.json"))
+    model_cat.save_model(os.path.join(MODELS_DIR, "leakage_free_pof_catboost.cbm"))
 
+    logger.info(f"[ML] Modeller kaydedildi → {MODELS_DIR}")
 
 # ----------------------------------------------------------------------
 # ANA AKIŞ
@@ -674,14 +893,20 @@ def main():
             "MTBF_Gun",
             "Ariza_Sayisi",
             "Ariza_Gecmisi",
-            "Kronik_Flag_90g",
+            "Kronik_90g_Flag",
+            "Kronik_Kritik",  # Multi-level chronic flags
+            "Kronik_Yuksek",
+            "Kronik_Orta",
+            "Kronik_Gozlem",
+            "Kronik_Seviye_Max",
             "Son_Ariza_Gun_Sayisi",
             "Bakim_Sayisi",
+            "Bakim_Var_Mi",  # Binary maintenance indicator
             "Ilk_Bakim_Tarihi",
             "Son_Bakim_Tarihi",
             "Son_Bakimdan_Gecen_Gun",
             "Son_Bakim_Tipi",
-            "Gecmis_Bakim_Tipleri",
+            "Bakim_Is_Emri_Tipleri",
             "Gerilim_Seviyesi",
             "kVA_Rating",
             "Marka",
@@ -752,8 +977,58 @@ def main():
         # 7) ML tabanlı statik PoF (XGBoost + CatBoost)
         # --------------------------------------------------------------
         logger.info("")
-        logger.info("[STEP] ML tabanlı statik PoF (XGBoost + CatBoost)")
-        train_ml_pof_models(df_full, logger)
+        logger.info("[STEP] Leakage-free ML PoF hesaplama başlıyor")
+
+        df_ml = build_leakage_free_ml_dataset(logger)
+        train_leakage_free_ml_models(df_ml, logger)
+
+        # --------------------------------------------------------------
+        # 8) Survival Curves and Advanced Visualizations
+        # --------------------------------------------------------------
+        logger.info("")
+        logger.info("[STEP] Generating survival curves and visualizations...")
+
+        try:
+            from utils.survival_plotting import (
+                plot_survival_curves_by_class,
+                plot_cox_coefficients,
+                plot_feature_importance_comparison
+            )
+            from config.config import VISUAL_DIR
+
+            # Plot survival curves
+            surv_plot_path = os.path.join(VISUAL_DIR, "survival_curves_by_class.png")
+            plot_survival_curves_by_class(
+                df=df_full,
+                output_path=surv_plot_path,
+                logger=logger
+            )
+
+            # Plot Cox coefficients
+            if cph is not None:
+                cox_plot_path = os.path.join(VISUAL_DIR, "cox_coefficients.png")
+                plot_cox_coefficients(
+                    cox_model=cph,
+                    output_path=cox_plot_path,
+                    logger=logger
+                )
+
+            # Plot feature importance comparison (if both available)
+            rsf_imp_path = os.path.join(OUTPUT_DIR, "rsf_feature_importance.csv")
+            shap_imp_path = os.path.join(OUTPUT_DIR, "shap_feature_importance.csv")
+            if os.path.exists(rsf_imp_path) and os.path.exists(shap_imp_path):
+                rsf_imp = pd.read_csv(rsf_imp_path, encoding="utf-8-sig")
+                shap_imp = pd.read_csv(shap_imp_path, encoding="utf-8-sig")
+                comp_plot_path = os.path.join(VISUAL_DIR, "feature_importance_comparison.png")
+                plot_feature_importance_comparison(
+                    rsf_importance=rsf_imp,
+                    shap_importance=shap_imp,
+                    output_path=comp_plot_path,
+                    logger=logger
+                )
+
+        except Exception as e:
+            logger.warning(f"[WARN] Visualization generation failed: {e}")
 
         logger.info("")
         logger.info("[SUCCESS] 03_sagkalim_modelleri başarıyla tamamlandı.")

@@ -38,8 +38,15 @@ for d in [INPUT_DIR, INTERMEDIATE_DIR, OUTPUT_DIR, VISUAL_DIR, LOG_DIR]:
 # Analiz Parametreleri
 # ======================================================
 
+# IMPORTANT: ANALYSIS_DATE will be overridden by DATA_END_DATE detected in Step 01
+# This ensures ML predictions don't extend beyond available data
 ANALYSIS_DATE = pd.Timestamp.today().normalize()
+
 MIN_EQUIPMENT_PER_CLASS = 30
+
+# Data validation parameters
+MIN_DATA_SPAN_YEARS = 2.0  # Minimum years of fault data required
+MIN_TRAIN_YEARS = 2.0      # Minimum years of training data before T_ref
 
 
 # ======================================================
@@ -70,7 +77,7 @@ FEATURE_OUTPUT_PATH = INTERMEDIATE_PATHS["ozellikler_pof3"]
 
 
 # ======================================================
-# Nihai Çıktılar (Müşteri-facing)
+# Nihai Çıktılar (Müşteri-facing - Turkish Names)
 # ======================================================
 
 OUTPUT_PATHS = {
@@ -80,16 +87,30 @@ OUTPUT_PATHS = {
     "sagkalim_taban": os.path.join(OUTPUT_DIR, "sagkalim_taban.csv"),
     "saglam_ekipman_listesi": os.path.join(OUTPUT_DIR, "saglam_ekipman_listesi.csv"),
 
-    # Step 03
-    "pof_cox": os.path.join(OUTPUT_DIR, "03_pof_cox_survival.csv"),
-    "pof_rsf": os.path.join(OUTPUT_DIR, "03_pof_rsf.csv"),
+    # Step 03 - Cox Survival Model Outputs
+    "cox_3ay": os.path.join(OUTPUT_DIR, "cox_sagkalim_3ay_ariza_olasiligi.csv"),
+    "cox_6ay": os.path.join(OUTPUT_DIR, "cox_sagkalim_6ay_ariza_olasiligi.csv"),
+    "cox_12ay": os.path.join(OUTPUT_DIR, "cox_sagkalim_12ay_ariza_olasiligi.csv"),
 
-    # Step 04
-    "chronic_failures": os.path.join(OUTPUT_DIR, "04_chronic_failures.csv"),
+    # Step 03 - RSF Survival Model Outputs
+    "rsf_3ay": os.path.join(OUTPUT_DIR, "rsf_sagkalim_3ay_ariza_olasiligi.csv"),
+    "rsf_6ay": os.path.join(OUTPUT_DIR, "rsf_sagkalim_6ay_ariza_olasiligi.csv"),
+    "rsf_12ay": os.path.join(OUTPUT_DIR, "rsf_sagkalim_12ay_ariza_olasiligi.csv"),
 
-    # Step 05
-    "risk_scores": os.path.join(OUTPUT_DIR, "05_risk_scores.csv"),
-    "risk_matrix": os.path.join(OUTPUT_DIR, "05_risk_matrix.csv"),
+    # Step 03 - Leakage-Free ML Model Outputs
+    "leakage_free_ml_pof": os.path.join(OUTPUT_DIR, "leakage_free_ml_pof.csv"),
+
+    # Step 04 - Chronic Equipment Analysis
+    "chronic_summary": os.path.join(OUTPUT_DIR, "chronic_equipment_summary.csv"),
+    "chronic_only": os.path.join(OUTPUT_DIR, "chronic_equipment_only.csv"),
+
+    # Documentation
+    "readme": os.path.join(OUTPUT_DIR, "OKUBBENI.txt"),
+}
+
+# Legacy aliases for backward compatibility
+RESULT_PATHS = {
+    "POF": OUTPUT_DIR,
 }
 
 
@@ -113,11 +134,14 @@ VISUAL_PATHS = {
 
 # Prediction horizons in days for survival analysis
 # These represent the time windows for which we predict Probability of Failure (PoF)
-SURVIVAL_HORIZONS = [90, 180, 365]  # 3 months, 6 months, 12 months
+SURVIVAL_HORIZONS = [90, 180, 365, 730]  # 3, 6, 12, 24 months
 
 # Convert to months for labeling (used in some scripts)
-SURVIVAL_HORIZONS_MONTHS = [3, 6, 12]
+SURVIVAL_HORIZONS_MONTHS = [3, 6, 12, 24]
 
+ML_REF_DAYS_BEFORE_ANALYSIS = 365
+ML_PREDICTION_WINDOW_DAYS   = 365
+RANDOM_STATE                 = 42
 
 # ============================
 # CHRONIC FAILURE DETECTION
