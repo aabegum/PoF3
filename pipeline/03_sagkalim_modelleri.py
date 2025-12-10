@@ -398,12 +398,12 @@ def fit_cox_model(df_cox: pd.DataFrame, logger: logging.Logger) -> CoxPHFitter:
 def compute_pof_from_cox(
     cph: CoxPHFitter,
     df_cox: pd.DataFrame,
-    horizons_months,
+    horizons_days,
     logger: logging.Logger,
 ) -> dict:
     """
     Cox modeli üzerinden farklı ufuklar için PoF hesaplar.
-    Dönüş: {ay: pd.Series(index=cbs_id, values=PoF)}
+    Dönüş: {days: pd.Series(index=cbs_id, values=PoF)}
     """
     logger.info("[STEP] Cox modeli ile PoF hesaplanıyor")
 
@@ -413,9 +413,10 @@ def compute_pof_from_cox(
 
     results = {}
 
-    for m in horizons_months:
-        days = m * 30
-        logger.info(f"  Ufuk: {m} ay ({days} gün)")
+    for days in horizons_days:
+        # Convert days to months for labeling
+        months = round(days / 30)
+        logger.info(f"  Ufuk: {days} gün (~{months} ay)")
 
         try:
             surv = cph.predict_survival_function(X, times=[days]).T
@@ -493,7 +494,7 @@ def fit_rsf_model(df_cox: pd.DataFrame, logger: logging.Logger):
 def compute_pof_from_rsf(
     rsf_model,
     df_cox: pd.DataFrame,
-    horizons_months,
+    horizons_days,
     logger: logging.Logger,
 ) -> dict:
     if rsf_model is None:
@@ -510,9 +511,10 @@ def compute_pof_from_rsf(
 
     surv_fns = rsf_model.predict_survival_function(X)
 
-    for m in horizons_months:
-        days = m * 30
-        logger.info(f"  RSF ufuk: {m} ay ({days} gün)")
+    for days in horizons_days:
+        # Convert days to months for labeling
+        months = round(days / 30)
+        logger.info(f"  RSF ufuk: {days} gün (~{months} ay)")
 
         try:
             pof_vals = np.array([1.0 - fn(days) for fn in surv_fns])
@@ -930,7 +932,8 @@ def main():
         cph = fit_cox_model(df_cox, logger)
         logger.info("")
 
-        pof_cox = compute_pof_from_cox(cph, df_cox, SURVIVAL_HORIZONS_MONTHS, logger)
+        # Use actual days from config and convert to months for labeling
+        pof_cox = compute_pof_from_cox(cph, df_cox, [int(d/30) for d in SURVIVAL_HORIZONS], logger)
         logger.info("")
 
         # --------------------------------------------------------------
@@ -939,14 +942,16 @@ def main():
         logger.info("[STEP] Cox PoF çıktılarını kaydetme")
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-        for m, series in pof_cox.items():
+        for days, series in pof_cox.items():
+            # Convert days to months for labeling
+            months = round(days / 30)
             out_df = pd.DataFrame(
                 {
                     "cbs_id": series.index,
-                    f"PoF_Cox_{m}Ay": series.values,
+                    f"PoF_Cox_{months}Ay": series.values,
                 }
             )
-            out_path = os.path.join(OUTPUT_DIR, f"cox_sagkalim_{m}ay_ariza_olasiligi.csv")
+            out_path = os.path.join(OUTPUT_DIR, f"cox_sagkalim_{months}ay_ariza_olasiligi.csv")
             out_df.to_csv(out_path, index=False, encoding="utf-8-sig")
             logger.info(f"[OK] {out_path}")
 
@@ -956,18 +961,20 @@ def main():
         logger.info("")
         logger.info("[STEP] Random Survival Forest (RSF) adımı")
         rsf = fit_rsf_model(df_cox, logger)
-        rsf_pof = compute_pof_from_rsf(rsf, df_cox, SURVIVAL_HORIZONS_MONTHS, logger)
+        rsf_pof = compute_pof_from_rsf(rsf, df_cox, [int(d/30) for d in SURVIVAL_HORIZONS], logger)
 
         if rsf_pof:
             logger.info("[STEP] RSF PoF çıktılarını kaydetme")
-            for m, series in rsf_pof.items():
+            for days, series in rsf_pof.items():
+                # Convert days to months for labeling
+                months = round(days / 30)
                 out_df = pd.DataFrame(
                     {
                         "cbs_id": series.index,
-                        f"PoF_RSF_{m}Ay": series.values,
+                        f"PoF_RSF_{months}Ay": series.values,
                     }
                 )
-                out_path = os.path.join(OUTPUT_DIR, f"rsf_sagkalim_{m}ay_ariza_olasiligi.csv")
+                out_path = os.path.join(OUTPUT_DIR, f"rsf_sagkalim_{months}ay_ariza_olasiligi.csv")
                 out_df.to_csv(out_path, index=False, encoding="utf-8-sig")
                 logger.info(f"[OK] {out_path}")
         else:
