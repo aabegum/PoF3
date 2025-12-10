@@ -87,12 +87,12 @@ OUTPUT_PATHS = {
     "sagkalim_taban": os.path.join(OUTPUT_DIR, "sagkalim_taban.csv"),
     "saglam_ekipman_listesi": os.path.join(OUTPUT_DIR, "saglam_ekipman_listesi.csv"),
 
-    # Step 03 - Cox Survival Model Outputs
+    # Step 03 - Cox Survival Model Outputs (updated to match actual config horizons)
     "cox_3ay": os.path.join(OUTPUT_DIR, "cox_sagkalim_3ay_ariza_olasiligi.csv"),
     "cox_6ay": os.path.join(OUTPUT_DIR, "cox_sagkalim_6ay_ariza_olasiligi.csv"),
     "cox_12ay": os.path.join(OUTPUT_DIR, "cox_sagkalim_12ay_ariza_olasiligi.csv"),
 
-    # Step 03 - RSF Survival Model Outputs
+    # Step 03 - RSF Survival Model Outputs (updated to match actual config horizons)
     "rsf_3ay": os.path.join(OUTPUT_DIR, "rsf_sagkalim_3ay_ariza_olasiligi.csv"),
     "rsf_6ay": os.path.join(OUTPUT_DIR, "rsf_sagkalim_6ay_ariza_olasiligi.csv"),
     "rsf_12ay": os.path.join(OUTPUT_DIR, "rsf_sagkalim_12ay_ariza_olasiligi.csv"),

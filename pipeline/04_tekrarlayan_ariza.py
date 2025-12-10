@@ -23,13 +23,16 @@ if ROOT not in sys.path:
 # --------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parents[1]
 
-# Config dosyasından ayarları al
+# Import configuration
 try:
     from config.config import (
         INTERMEDIATE_PATHS,
         OUTPUT_DIR as CONFIG_OUTPUT_DIR,
         LOG_DIR as CONFIG_LOG_DIR,
         ANALYSIS_DATE as CONFIG_ANALYSIS_DATE,
+        CHRONIC_WINDOW_DAYS,
+        CHRONIC_THRESHOLD_EVENTS,
+        CHRONIC_MIN_RATE,
     )
     INTERMEDIATE_DIR = Path(list(INTERMEDIATE_PATHS.values())[0]).parent
     OUTPUT_DIR = Path(CONFIG_OUTPUT_DIR)
@@ -42,6 +45,9 @@ except Exception:
     OUTPUT_DIR = DATA_DIR / "sonuclar"
     LOG_DIR = BASE_DIR / "loglar"
     ANALYSIS_DATE = datetime(2025, 12, 4)
+    CHRONIC_WINDOW_DAYS = 90
+    CHRONIC_THRESHOLD_EVENTS = 3
+    CHRONIC_MIN_RATE = 1.5
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -50,12 +56,17 @@ LOG_FILE = LOG_DIR / f"04_chronic_detection_{datetime.now().strftime('%Y%m%d_%H%
 logger = get_logger("04_chronic_detection", LOG_FILE)
 
 # Kronik tanım parametreleri - Çok Seviyeli Sistem
+# Use consistent thresholds with step 02 for consistency
 CHRONIC_DEFINITIONS = {
     "KRITIK": {"window_days": 90, "min_faults": 3, "desc": "3+ arıza 90 günde - ACİL MÜDAHALE"},
     "YUKSEK": {"window_days": 365, "min_faults": 4, "desc": "4+ arıza 12 ayda - ÖNCELİKLİ"},
     "ORTA": {"window_days": 365, "min_faults": 3, "desc": "3+ arıza 12 ayda - TAKİP"},
     "GOZLEM": {"window_days": 180, "min_faults": 2, "desc": "2+ arıza 6 ayda - İZLEME"},
 }
+
+# For consistency with step 02, we also define the 90g flag as defined in config
+CHRONIC_90G_WINDOW_DAYS = CHRONIC_WINDOW_DAYS  # From config
+CHRONIC_90G_MIN_FAULTS = CHRONIC_THRESHOLD_EVENTS  # From config
 
 
 # --------------------------------------------------------------------
@@ -203,6 +214,31 @@ def build_chronic_table(events: pd.DataFrame, equipment: pd.DataFrame) -> pd.Dat
         logger.warning("[WARN] Kronik oranı %15 üzeri – eşikleri gözden geçirmeniz gerekebilir.")
     elif chronic_rate < 0.03:
         logger.warning("[WARN] Kronik oranı %3 altında – model fazla katı olabilir.")
+
+    # Calculate the same 90g flag as step 02: any two consecutive failures within the window
+    logger.info("[INFO] Calculating 90g flag (same as step 02 logic)...")
+    
+    # Rebuild the events by cbs_id to calculate the 90g flag properly
+    ev_sorted = ev.sort_values(["cbs_id", "Ariza_Baslangic_Zamani"])
+    chronic_90g_flags = []
+    
+    for cbs_id, group in ev_sorted.groupby("cbs_id"):
+        times = group["Ariza_Baslangic_Zamani"].dropna().sort_values().values
+        n_faults = len(times)
+        
+        kronik_90g = 0
+        if n_faults >= 2:
+            # Calculate differences between consecutive failures
+            diffs = np.diff(times).astype("timedelta64[D]").astype(int)
+            # Check if any consecutive failures are within the window
+            kronik_90g = int((diffs <= CHRONIC_90G_WINDOW_DAYS).any())
+        
+        chronic_90g_flags.append((cbs_id, kronik_90g))
+    
+    # Create a mapping for the 90g flags
+    chronic_90g_df = pd.DataFrame(chronic_90g_flags, columns=["cbs_id", "Kronik_90G_Flag"])
+    stats = stats.merge(chronic_90g_df, on="cbs_id", how="left")
+    stats["Kronik_90G_Flag"] = stats["Kronik_90G_Flag"].fillna(0).astype(int)
 
     return stats
 
