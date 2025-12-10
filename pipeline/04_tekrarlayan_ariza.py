@@ -46,8 +46,8 @@ except Exception:
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-LOG_FILE = LOG_DIR / f"04_chronic_detection_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-logger = get_logger("04_chronic_detection", LOG_FILE)
+LOG_FILE = LOG_DIR / f"04_tekrarlayan_ariza_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logger = get_logger("04_tekrarlayan_ariza", LOG_FILE)
 
 # Kronik tanım parametreleri - Çok Seviyeli Sistem
 CHRONIC_DEFINITIONS = {
@@ -63,7 +63,7 @@ CHRONIC_DEFINITIONS = {
 # --------------------------------------------------------------------
 def load_intermediate_data():
     logger.info("=" * 80)
-    logger.info("04_chronic_detection - PoF3 Kronik Arıza Analizi")
+    logger.info("04_tekrarlayan_ariza - PoF3 Kronik Arıza Analizi")
     logger.info("=" * 80)
     logger.info("")
 
@@ -275,9 +275,9 @@ def main():
         chronic_stats = build_chronic_table(events, equipment)
         chronic_full = merge_with_feature_flags(chronic_stats, features)
         save_outputs(chronic_full)
-        logger.info("[SUCCESS] 04_chronic_detection başarıyla tamamlandı.")
+        logger.info("[SUCCESS] 04_tekrarlayan_ariza başarıyla tamamlandı.")
     except Exception as e:
-        logger.exception(f"[FATAL] 04_chronic_detection hata ile sonlandı: {e}")
+        logger.exception(f"[FATAL] 04_tekrarlayan_ariza hata ile sonlandı: {e}")
         raise
 
 
