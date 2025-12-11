@@ -86,7 +86,7 @@ OUTPUT_PATHS = {
     "ekipman_listesi": os.path.join(OUTPUT_DIR, "ekipman_listesi.csv"),
     "sagkalim_taban": os.path.join(OUTPUT_DIR, "sagkalim_taban.csv"),
     "saglam_ekipman_listesi": os.path.join(OUTPUT_DIR, "saglam_ekipman_listesi.csv"),
-
+    "final_risk_report": os.path.join(OUTPUT_DIR, "FINAL_ASSET_RISK_REPORT.xlsx"),
     # Step 03 - Cox Survival Model Outputs (updated to match actual config horizons)
     "cox_3ay": os.path.join(OUTPUT_DIR, "cox_sagkalim_3ay_ariza_olasiligi.csv"),
     "cox_6ay": os.path.join(OUTPUT_DIR, "cox_sagkalim_6ay_ariza_olasiligi.csv"),
@@ -107,7 +107,31 @@ OUTPUT_PATHS = {
     # Documentation
     "readme": os.path.join(OUTPUT_DIR, "OKUBBENI.txt"),
 }
+# ======================================================
+# Ekstra Veri Kolonları (Fault Data'dan kazanılacaklar)
+# ======================================================
 
+# Arıza verisinden okunacak ve Equipment Master'a taşınacak kolonlar
+EXTRA_FAULT_COLS = [
+    "KOORDINAT_X", "KOORDINAT_Y", 
+    "İl", "İlçe", "Mahalle", 
+    "total customer count", 
+    "urban mv", "urban lv", 
+    "rural mv", "rural lv", 
+    "suburban mv", "suburban lv"
+]
+
+# Rename mapping for internal standardization (Turkish -> English/Standard)
+COLUMN_MAPPING = {
+    "KOORDINAT_X": "Latitude",   # Check if X is Lat or Lon in your data usually X=Lon, Y=Lat but often mixed
+    "KOORDINAT_Y": "Longitude",
+    "İl": "Sehir",
+    "İlçe": "Ilce",
+    "Mahalle": "Mahalle",
+    "total customer count": "Musteri_Sayisi",
+    # We will combine urban/rural cols into a single "Environment_Type" later, 
+    # but for now keep them raw or map them.
+}
 # Legacy aliases for backward compatibility
 RESULT_PATHS = {
     "POF": OUTPUT_DIR,

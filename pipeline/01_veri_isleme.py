@@ -20,7 +20,7 @@ import os
 import sys
 import logging
 from datetime import datetime
-
+from scipy import stats
 import numpy as np
 import pandas as pd
 
@@ -108,13 +108,13 @@ def clean_equipment_type(series: pd.Series) -> pd.Series:
 def _rename_maintenance_and_attributes(df: pd.DataFrame, logger: logging.Logger) -> pd.DataFrame:
     """
     Arıza / sağlam verisindeki bakım ve ekipman nitelik kolonlarını
-    iç standarda çevirir. Eksik olanları LOGLER.
+    iç standarda çevirir.
     """
     col_map = {
         "Bakım Sayısı": "Bakim_Sayisi",
         "Geçmiş İş Emri Tipleri": "Bakim_Is_Emri_Tipleri",
         "İlk Bakım İş Emri Tarihi": "Ilk_Bakim_Tarihi",
-        "Son Bakım": "Son_Bakim_Tarihi",
+        "Son Bakım İş Emri Tarihi": "Son_Bakim_Tarihi", # Correct Excel Name
         "Son Bakım İş Emri Tipi": "Son_Bakim_Tipi",
         "Son Bakımdan İtibaren Geçen Gün Sayısı": "Son_Bakimdan_Gecen_Gun",
         "MARKA": "Marka",
@@ -123,24 +123,30 @@ def _rename_maintenance_and_attributes(df: pd.DataFrame, logger: logging.Logger)
         "kVA_Rating": "kVA_Rating",
     }
 
-    # Eksik bakım/nitelik kolonlarını logla
-    expected_important = ["Bakım Sayısı", "Son Bakım", "MARKA", "kVA_Rating"]
+    # FIX: Update this list to match the ACTUAL Excel headers
+    expected_important = [
+        "Bakım Sayısı", 
+        "Son Bakım İş Emri Tarihi", # Updated from "Son Bakım"
+        "MARKA", 
+        "kVA_Rating"
+    ]
+    
     missing_important = [c for c in expected_important if c not in df.columns]
     if missing_important:
         logger.warning(f"[MAINTENANCE] Eksik önemli kolonlar: {missing_important}")
 
-    # Mevcut olanları renameliyoruz
+    # Renaming logic remains the same
     to_rename = {k: v for k, v in col_map.items() if k in df.columns}
     if to_rename:
         df = df.rename(columns=to_rename)
         logger.info(f"[MAINTENANCE] Renamed {len(to_rename)} maintenance/attribute columns")
 
-    # Tarih tipine çevrilecek kolonlar
+    # Date parsing logic remains the same
     for date_col in ["Ilk_Bakim_Tarihi", "Son_Bakim_Tarihi"]:
         if date_col in df.columns:
             df[date_col] = df[date_col].apply(parse_date_safely)
 
-    # Sayısal kolonlar
+    # Numeric conversion logic remains the same
     if "Bakim_Sayisi" in df.columns:
         df["Bakim_Sayisi"] = pd.to_numeric(df["Bakim_Sayisi"], errors="coerce")
     if "Son_Bakimdan_Gecen_Gun" in df.columns:
@@ -156,7 +162,7 @@ def generate_missingness_report(df: pd.DataFrame, logger: logging.Logger,
     """
     logger.info(f"[MISSINGNESS] Generating detailed report for {data_type}...")
     
-    # Overall missingness
+    # Overall missingness logic remains the same...
     total_rows = len(df)
     missing_summary = []
     
@@ -172,7 +178,7 @@ def generate_missingness_report(df: pd.DataFrame, logger: logging.Logger,
     
     missing_df = pd.DataFrame(missing_summary).sort_values("Missing_Percentage", ascending=False)
     
-    # Kritik kolonlar için detaylı analiz
+    # Critical columns logic remains the same...
     critical_cols = ["Kurulum_Tarihi", "started at", "Süre_Ham", "Ekipman_Tipi"]
     critical_missing = missing_df[missing_df["Column"].isin(critical_cols)]
     
@@ -181,7 +187,7 @@ def generate_missingness_report(df: pd.DataFrame, logger: logging.Logger,
         for _, row in critical_missing.iterrows():
             logger.warning(f"  - {row['Column']}: {row['Missing_Count']} ({row['Missing_Percentage']}%)")
     
-    # Ekipman tipine göre eksiklik analizi
+    # FIX: Add include_groups=False to silence the FutureWarning
     if "Ekipman_Tipi" in df.columns:
         equipment_missing = df.groupby("Ekipman_Tipi").apply(
             lambda x: pd.Series({
@@ -189,77 +195,86 @@ def generate_missingness_report(df: pd.DataFrame, logger: logging.Logger,
                 "Missing_Installation": x["Kurulum_Tarihi"].isna().sum(),
                 "Missing_Started": x["started at"].isna().sum() if "started at" in x.columns else 0,
                 "Missing_Duration": x["Süre_Ham"].isna().sum() if "Süre_Ham" in x.columns else 0
-            })
+            }),
+            include_groups=False  # <--- THIS IS THE FIX
         ).reset_index()
         
         equipment_missing_path = os.path.join(output_dir, f"{data_type}_missing_by_equipment.csv")
         equipment_missing.to_csv(equipment_missing_path, index=False, encoding="utf-8-sig")
         logger.info(f"[MISSINGNESS] Equipment-wise report → {equipment_missing_path}")
     
-    # Genel rapor kaydet
+    # Save overall report logic remains the same...
     missing_path = os.path.join(output_dir, f"{data_type}_missingness_report.csv")
     missing_df.to_csv(missing_path, index=False, encoding="utf-8-sig")
     logger.info(f"[MISSINGNESS] Overall report → {missing_path}")
-    logger.info(f"[MISSINGNESS] Total columns: {len(missing_df)}, Columns with >10% missing: {(missing_df['Missing_Percentage'] > 10).sum()}")
 
 
 def detect_duration_outliers(df: pd.DataFrame, logger: logging.Logger, output_dir: str) -> pd.DataFrame:
     """
-    Arıza süresi için outlier detection yapar ve raporlar.
+    ENHANCED: Uses Median Absolute Deviation (MAD) on Log-Scale.
+    Why: Fault durations are Log-Normal. IQR is too aggressive and kills valid long repairs.
+    This method only removes physically impossible data errors (e.g., > 6 Sigma).
     """
-    logger.info("[OUTLIER] Detecting fault duration outliers...")
+    logger.info("[OUTLIER] Starting Robust Duration Diagnostics...")
     
     duration_col = "Süre_Dakika"
     if duration_col not in df.columns:
-        logger.warning("[OUTLIER] Duration column not found, skipping outlier detection")
+        logger.warning("[OUTLIER] Duration column not found, skipping.")
         return df
     
-    # İstatistikler
-    q01 = df[duration_col].quantile(0.01)
-    q25 = df[duration_col].quantile(0.25)
-    q50 = df[duration_col].quantile(0.50)
-    q75 = df[duration_col].quantile(0.75)
-    q99 = df[duration_col].quantile(0.99)
-    iqr = q75 - q25
-    
-    logger.info(f"[OUTLIER] Duration statistics (minutes):")
-    logger.info(f"  - P01: {q01:.2f}, P25: {q25:.2f}, P50: {q50:.2f}, P75: {q75:.2f}, P99: {q99:.2f}")
-    logger.info(f"  - IQR: {iqr:.2f}")
-    
-    # IQR method
-    lower_bound = q25 - 3 * iqr
-    upper_bound = q75 + 3 * iqr
-    
-    # Quantile method (more conservative)
-    outliers_low = df[duration_col] < q01
-    outliers_high = df[duration_col] > q99
-    outliers_iqr = (df[duration_col] < lower_bound) | (df[duration_col] > upper_bound)
-    
-    logger.info(f"[OUTLIER] Low outliers (<P01): {outliers_low.sum()}")
-    logger.info(f"[OUTLIER] High outliers (>P99): {outliers_high.sum()}")
-    logger.info(f"[OUTLIER] IQR outliers: {outliers_iqr.sum()}")
-    
-    # Flag outliers
-    df["Duration_Outlier_Flag"] = (outliers_low | outliers_high).astype(int)
-    
-    # Rapor
-    outlier_records = df[df["Duration_Outlier_Flag"] == 1].copy()
-    if not outlier_records.empty:
-        outlier_path = os.path.join(output_dir, "duration_outliers_report.csv")
-        outlier_records.to_csv(outlier_path, index=False, encoding="utf-8-sig")
-        logger.info(f"[OUTLIER] Outlier report saved → {outlier_path}")
-    
-    # Ekstrem değerleri logla
-    extreme_low = df[df[duration_col] < 1]  # < 1 minute
-    extreme_high = df[df[duration_col] > 10080]  # > 7 days
-    
-    if not extreme_low.empty:
-        logger.warning(f"[OUTLIER] {len(extreme_low)} faults with duration < 1 minute (potential false alarms)")
-    if not extreme_high.empty:
-        logger.warning(f"[OUTLIER] {len(extreme_high)} faults with duration > 7 days (potential data errors)")
-    
-    return df
+    # 1. Negative Duration Check (Absolute Physics Violation)
+    neg_mask = df[duration_col] <= 0
+    if neg_mask.sum() > 0:
+        logger.warning(f"[PHYSICS] Dropping {neg_mask.sum()} records with duration <= 0 minutes")
+        df = df[~neg_mask].copy()
 
+    # 2. Log-Normal Transformation
+    # We add 1 minute (np.log1p) to avoid log(0) errors
+    log_durations = np.log1p(df[duration_col])
+    
+    # 3. Robust Statistics (Median & MAD)
+    # MAD is like Standard Deviation but ignores crazy outliers
+    median_log = log_durations.median()
+    mad_log = stats.median_abs_deviation(log_durations)
+    
+    # If MAD is 0 (e.g., 50% of data is exactly the same), fallback to a small epsilon
+    if mad_log == 0:
+        mad_log = 1e-6
+
+    # Standard Sigma equivalent for MAD is 1.4826
+    sigma_robust = mad_log * 1.4826
+    
+    # 4. Calculate Cutoffs (6 Sigma is very safe - only deletes errors)
+    upper_limit_log = median_log + (6 * sigma_robust)
+    
+    # Convert back to minutes for human readability
+    upper_limit_min = np.expm1(upper_limit_log)
+    median_min = np.expm1(median_log)
+    
+    logger.info(f"[OUTLIER] Robust Statistics (Log-Normal Assumed):")
+    logger.info(f"  - Median Duration: {median_min:.1f} min")
+    logger.info(f"  - Upper Cutoff (6σ): {upper_limit_min:.1f} min ({upper_limit_min/60/24:.1f} days)")
+    
+    # 5. Identify and Flag Outliers
+    outlier_mask = log_durations > upper_limit_log
+    n_outliers = outlier_mask.sum()
+    
+    if n_outliers > 0:
+        logger.warning(f"[OUTLIER] Detected {n_outliers} extreme outliers (> {upper_limit_min:.0f} min)")
+        
+        # Save report before dropping
+        outlier_records = df[outlier_mask].copy()
+        if not outlier_records.empty:
+            outlier_path = os.path.join(output_dir, "duration_outliers_report.csv")
+            outlier_records.to_csv(outlier_path, index=False, encoding="utf-8-sig")
+            logger.info(f"[OUTLIER] Saved report to {outlier_path}")
+        
+        # Drop them (Filtering)
+        df = df[~outlier_mask].copy()
+    else:
+        logger.info("[OUTLIER] No extreme outliers detected.")
+        
+    return df
 
 # ---------------------------------------------------------
 # Veri Yükleme
@@ -274,15 +289,51 @@ def load_fault_data(logger: logging.Logger) -> pd.DataFrame:
 
     df = pd.read_excel(path)
     df.columns = [c.strip() for c in df.columns]
+    maintenance_cols_to_keep = [
+            "Bakım Sayısı", 
+            "Son Bakım İş Emri Tarihi", 
+            "İlk Bakım İş Emri Tarihi",
+            "Son Bakım İş Emri Tipi",
+            "MARKA", 
+            "kVA_Rating", 
+            "component_voltage", 
+            "voltage_level"
+        ]
+# UPDATE: Add new columns to the list of columns to keep
+    # We use .get() or check existence to avoid errors if some are missing in future files
+# Mevcutsa listeye ekle
+    found_maint_cols = [c for c in maintenance_cols_to_keep if c in df.columns]
 
-    required = [
+    # Extra cols (Geo/Customer) + Maintenance Cols
+    extra_cols_to_keep = []
+    from config.config import EXTRA_FAULT_COLS, COLUMN_MAPPING
+    
+    for col in EXTRA_FAULT_COLS:
+        if col in df.columns:
+            extra_cols_to_keep.append(col)
+            
+    # Hepsini birleştir
+    cols_to_use = [
         "cbs_id", "Şebeke Unsuru", "Sebekeye_Baglanma_Tarihi",
         "started at", "ended at", "duration time", "cause code"
-    ]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"FATAL: Arıza verisinde eksik kolonlar var: {missing}")
-
+    ] + extra_cols_to_keep + found_maint_cols  # <-- BURADA EKLENDİ
+    
+    # Filter df
+    df = df[cols_to_use].copy()
+    
+    # Rename standard columns (Existing code)
+    rename_map = {
+        "Şebeke Unsuru": "Ekipman_Tipi",
+        "Sebekeye_Baglanma_Tarihi": "Kurulum_Tarihi",
+        "cause code": "Ariza_Nedeni",
+        "duration time": "Süre_Ham",
+    }
+    # Add the extra column renames
+    for old_col in extra_cols_to_keep:
+        if old_col in COLUMN_MAPPING:
+            rename_map[old_col] = COLUMN_MAPPING[old_col]
+            
+    df.rename(columns=rename_map, inplace=True)
     original_count = len(df)
     logger.info(f"[INFO] Orijinal arıza kayıtları: {original_count:,}")
 
@@ -539,11 +590,32 @@ def _aggregate_equipment_block(df: pd.DataFrame, logger: logging.Logger, source:
     }
 
     if source == "fault":
-        agg_dict.update({
-            "Fault_Count": ("cbs_id", "size"),
-            "Ilk_Ariza_Tarihi": ("started at", "min"),
-            "Son_Ariza_Tarihi": ("started at", "max"),  # En son arıza tarihi
-        })
+            agg_dict.update({
+                "Fault_Count": ("cbs_id", "size"),
+                "Ilk_Ariza_Tarihi": ("started at", "min"),
+                "Son_Ariza_Tarihi": ("started at", "max"),
+            })
+            
+            # NEW: Aggregate Geo & Consequence Data
+            # Strategy: 
+            # - Location: Take 'first' (assuming it doesn't move)
+            # - Customer Count: Take 'max' (Worst case scenario for risk)
+            # - Urban/Rural: Take 'max' (If it was ever Urban, treat as Urban)
+            
+            # Check which renamed columns exist in the df
+            possible_geo_cols = ["Latitude", "Longitude", "Sehir", "Ilce", "Mahalle"]
+            for col in possible_geo_cols:
+                if col in df.columns:
+                    agg_dict[col] = (col, "first")
+                    
+            if "Musteri_Sayisi" in df.columns:
+                agg_dict["Musteri_Sayisi"] = ("Musteri_Sayisi", "max")
+                
+            # For the raw urban/rural columns (if they exist)
+            env_cols = ["urban mv", "urban lv", "rural mv", "rural lv", "suburban mv", "suburban lv"]
+            for col in env_cols:
+                if col in df.columns:
+                    agg_dict[col] = (col, "max")
 
     # Opsiyonel bakım/nitelik kolonları
     opt_cols = [
@@ -616,7 +688,18 @@ def build_equipment_master(df_fault: pd.DataFrame,
     dropped_dupes = before_dedup - len(all_eq)
     if dropped_dupes > 0:
         logger.info(f"[DEDUP] Dropped {dropped_dupes} duplicate cbs_id records (kept fault records)")
-
+# NEW: Flag missing Location/Consequence data
+    # This helps us identify "Ghost Assets" (we know they exist, but not where)
+    if "Latitude" in all_eq.columns:
+        all_eq["Location_Known"] = all_eq["Latitude"].notna().astype(int)
+    else:
+        all_eq["Location_Known"] = 0
+        
+    # Default Customer Count to Median if missing (or 0, depending on preference)
+    # For Risk Analysis, 0 is dangerous. Let's flag it.
+    if "Musteri_Sayisi" in all_eq.columns:
+         # Fill with -1 to indicate 'Unknown' for now
+         all_eq["Musteri_Sayisi"] = all_eq["Musteri_Sayisi"].fillna(-1)
     # ============================================
     # AGE CALCULATION: Use DATA_END_DATE instead of ANALYSIS_DATE
     # ============================================

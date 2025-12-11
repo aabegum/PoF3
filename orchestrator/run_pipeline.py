@@ -11,23 +11,35 @@ try:
 except Exception:
     pass
 
-# Orchestrator klasöründen bir üst klasörü proje kökü yap
+# Proje Kökü
 PROJE_KOKU = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Core pipeline steps (implemented and tested)
+# ------------------------------------------------------------------------------
+# PIPELINE DEFINITION (Updated Structure)
+# Format: (Step Name, Script Path, Is Critical?)
+# ------------------------------------------------------------------------------
 ADIMLAR = [
-    ("01_veri_isleme",          os.path.join("pipeline", "01_veri_isleme.py"), True),   # Critical
-    ("02_ozellik_muhendisligi", os.path.join("pipeline", "02_ozellik_muhendisligi.py"), True),   # Critical
-    ("03_sagkalim_modelleri",   os.path.join("pipeline", "03_sagkalim_modelleri.py"), True),   # Critical
-    ("04_tekrarlayan_ariza",    os.path.join("pipeline", "04_tekrarlayan_ariza.py"), True),   # Critical
-    ("05_risk_degerlendirme",   os.path.join("pipeline", "05_risk_degerlendirme.py"), False),  # Optional (needs CoF)
-    ("06_gorsellestirmeler",    os.path.join("pipeline", "06_gorsellestirmeler.py"), False),  # Optional
-    ("07_generate_deliverables", os.path.join("pipeline", "07_generate_deliverables.py"), False),  # Optional (final package)
+    # 1. Data Cleaning & Integration
+    ("01_veri_isleme",          os.path.join("pipeline", "01_veri_isleme.py"), True),
+    
+    # 2. Feature Engineering (Physics + History)
+    ("02_ozellik_muhendisligi", os.path.join("pipeline", "02_ozellik_muhendisligi.py"), True),
+    
+    # 3. AI Models (Cox + Weibull + RSF + ML + Ensemble)
+    # Note: Ensure your script is named '03_hibrit_model.py' or update here
+    ("03_hibrit_model",         os.path.join("pipeline", "03_hibrit_model.py"), True),
+    
+    # 4. Chronic Analysis (IEEE 1366)
+    ("04_tekrarlayan_ariza",    os.path.join("pipeline", "04_tekrarlayan_ariza.py"), True),
+    
+    # 4b. Risk Scoring (CoF * PoF) - NEW STEP
+    ("04_risk_scoring",         os.path.join("pipeline", "04_risk_scoring.py"), True),
+    
+    # 5. Reporting & Visualization (Merged 05+06+07) - NEW STEP
+    ("05_raporlama",            os.path.join("pipeline", "05_raporlama_ve_gorsellestirme.py"), False),
 ]
 
-
 def setup_master_logger():
-    """Setup master pipeline logger that writes to file and console."""
     log_dir = os.path.join(PROJE_KOKU, "loglar")
     os.makedirs(log_dir, exist_ok=True)
 
@@ -38,151 +50,87 @@ def setup_master_logger():
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
-    # File handler
     fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
     logger.addHandler(fh)
 
-    # Console handler
     ch = logging.StreamHandler(sys.stdout)
     ch.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(ch)
 
     return logger, log_path
 
-
 def calistir_adim(adim_adi: str, script_yolu: str, is_critical: bool, logger: logging.Logger) -> tuple:
-    """
-    Tek bir pipeline adımını çalıştırır.
-
-    Args:
-        adim_adi: Step name
-        script_yolu: Script path
-        is_critical: If True, failure stops pipeline. If False, failure is logged but pipeline continues.
-        logger: Master logger
-
-    Returns:
-        (duration, success): Tuple of duration in seconds and success boolean
-    """
     tam_yol = os.path.join(PROJE_KOKU, script_yolu)
 
     if not os.path.exists(tam_yol):
-        msg = f"[HATA] Adim script'i bulunamadi: {tam_yol}"
+        msg = f"[HATA] Script bulunamadi: {tam_yol}"
         if is_critical:
             logger.error(msg)
             raise FileNotFoundError(msg)
         else:
-            logger.warning(f"[WARN] {msg} - Atlaniyor (opsiyonel adim)")
+            logger.warning(f"[WARN] {msg} - Atlaniyor.")
             return 0.0, False
 
     logger.info("")
     logger.info("=" * 80)
-    logger.info(f"[PIPELINE] {adim_adi} baslatiliyor -> {script_yolu}")
+    logger.info(f"[PIPELINE] BASLATIYOR: {adim_adi}")
+    logger.info(f"   -> {script_yolu}")
     logger.info("=" * 80)
 
     start = time.time()
-
-    # Aynı Python yorumlayıcısını kullan (venv güvenli)
     cmd = [sys.executable, tam_yol]
-
-    # Çıktıyı direkt konsola akıtıyoruz; log dosyaları step içinde zaten tutuluyor
-    sonuc = subprocess.run(
-        cmd,
-        cwd=PROJE_KOKU,
-        shell=False
-    )
-
+    
+    # Run script
+    sonuc = subprocess.run(cmd, cwd=PROJE_KOKU, shell=False)
     sure = time.time() - start
 
     if sonuc.returncode != 0:
-        msg = f"[HATA] {adim_adi} adimi hata ile sonlandi. Return code: {sonuc.returncode}"
+        msg = f"[HATA] {adim_adi} basarisiz oldu. Kod: {sonuc.returncode}"
         if is_critical:
             logger.error(msg)
             raise RuntimeError(msg)
         else:
-            logger.warning(f"[WARN] {msg} - Devam ediliyor (opsiyonel adim)")
+            logger.warning(f"[WARN] {msg} - Devam ediliyor.")
             return sure, False
 
-    logger.info(f"[PIPELINE] {adim_adi} basariyla tamamlandi. Sure: {sure: .1f} sn")
+    logger.info(f"[OK] {adim_adi} tamamlandi ({sure:.1f} sn).")
     return sure, True
-
 
 def main():
     logger, log_path = setup_master_logger()
 
-    logger.info("")
     logger.info("=" * 80)
-    logger.info("PoF3 PIPELINE ORCHESTRATOR")
+    logger.info("PoF3 PIPELINE ORCHESTRATOR (v4.0 Final)")
+    logger.info(f"Zaman: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 80)
-    logger.info(f"Calistirma zamani: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info(f"Proje koku       : {PROJE_KOKU}")
-    logger.info(f"Python yorumlayici: {sys.executable}")
-    logger.info(f"Master log dosyasi: {log_path}")
-    logger.info("=" * 80)
-    logger.info("")
 
-    toplam_sure = 0.0
-    adim_sureleri = []
-    basarili_adimlar = []
-    basarisiz_adimlar = []
+    total_time = 0.0
+    results = []
 
     try:
-        for adim_adi, script_yolu, is_critical in ADIMLAR:
-            sure, success = calistir_adim(adim_adi, script_yolu, is_critical, logger)
-            adim_sureleri.append((adim_adi, sure, success))
-            toplam_sure += sure
-
-            if success:
-                basarili_adimlar.append(adim_adi)
-            else:
-                basarisiz_adimlar.append(adim_adi)
+        for name, path, crit in ADIMLAR:
+            duration, success = calistir_adim(name, path, crit, logger)
+            results.append((name, duration, success))
+            total_time += duration
 
         logger.info("")
         logger.info("=" * 80)
-        if basarisiz_adimlar:
-            logger.info("[PIPELINE] KRITIK ADIMLAR TAMAMLANDI (BAZI OPSIYONEL ADIMLAR ATLANABILIR)")
-        else:
-            logger.info("[PIPELINE] TUM ADIMLAR BASARIYLA TAMAMLANDI")
+        logger.info("PIPELINE OZET RAPORU")
         logger.info("=" * 80)
-        logger.info("Tamamlanan adimlar:")
-        for adim_adi, s, success in adim_sureleri:
-            status = "[OK]" if success else "[SKIP]"
-            logger.info(f"  {status} {adim_adi:30s}: {s:6.1f} sn")
+        
+        for name, dur, success in results:
+            status = "BASARILI" if success else "BASARISIZ"
+            logger.info(f"  {status:10s} {name:30s} : {dur:6.1f} sn")
+            
         logger.info("-" * 80)
-        logger.info(f"Toplam sure: {toplam_sure: .1f} sn")
-        logger.info(f"Basarili: {len(basarili_adimlar)}/{len(ADIMLAR)}")
-        if basarisiz_adimlar:
-            logger.info(f"Atlanan opsiyonel adimlar: {', '.join(basarisiz_adimlar)}")
-        logger.info("=" * 80)
-        logger.info("")
-        logger.info("Olusturulan ciktilar:")
-        logger.info("  - Cox PoF tahminleri (3, 6, 12, 24 ay)")
-        logger.info("  - RSF PoF tahminleri (3, 6, 12, 24 ay) + Feature Importance")
-        logger.info("  - ML PoF tahminleri (leakage-free, 2 reference windows)")
-        logger.info("  - Temporal CV robustness scores")
-        logger.info("  - SHAP feature importance")
-        logger.info("  - Kronik ekipman analizi (cok seviyeli)")
-        logger.info("  - Survival curves (gorseller/)")
-        logger.info("  - Executive deliverables (Excel + PowerPoint)")
-        logger.info("  - Turkce dokumantasyon (OKUBBENI.txt)")
-        logger.info("")
-        logger.info("Cikti dizini: data/sonuclar/")
-        logger.info("Gorsel dizini: gorseller/")
-        logger.info(f"Master log: {log_path}")
+        logger.info(f"Toplam Sure: {total_time:.1f} sn")
+        logger.info(f"Log Dosyasi: {log_path}")
         logger.info("=" * 80)
 
     except Exception as e:
-        logger.error("")
-        logger.error("=" * 80)
-        logger.error("[PIPELINE] HATA OLUSTU - PIPELINE DURDURULDU")
-        logger.error("=" * 80)
-        logger.error(str(e))
-        logger.error("")
-        logger.error("Detayli hata loglari ilgili adimin kendi log dosyasinda (loglar/ veya LOG_DIR) yer aliyor.")
-        logger.error(f"Master pipeline log: {log_path}")
-        logger.error("=" * 80)
+        logger.exception("PIPELINE KRITIK HATA ILE DURDU")
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
