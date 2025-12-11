@@ -355,7 +355,7 @@ def load_fault_data(logger: logging.Logger) -> pd.DataFrame:
     temporal_df["duration_mismatch"] = np.abs(
         temporal_df["ended_minus_started"] - temporal_df["Süre_Dakika"]
     ) > 5
-
+    
     logger.info(f"[TEMPORAL] ended < started: {temporal_df['invalid_order'].sum()}")
     logger.info(f"[TEMPORAL] started < installation date: {temporal_df['invalid_before_install'].sum()}")
     logger.info(f"[TEMPORAL] duration mismatch > 5 min: {temporal_df['duration_mismatch'].sum()}")
@@ -392,6 +392,7 @@ def load_fault_data(logger: logging.Logger) -> pd.DataFrame:
         temporal_df["invalid_before_install"] |
         temporal_df["duration_mismatch"]
     )
+    
     df = df[~temporal_bad].copy()
     dropped_temporal = before_temporal - len(df)
     if dropped_temporal > 0:

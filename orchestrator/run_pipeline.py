@@ -22,6 +22,7 @@ ADIMLAR = [
     ("04_tekrarlayan_ariza",    os.path.join("pipeline", "04_tekrarlayan_ariza.py"), True),   # Critical
     ("05_risk_degerlendirme",   os.path.join("pipeline", "05_risk_degerlendirme.py"), False),  # Optional (needs CoF)
     ("06_gorsellestirmeler",    os.path.join("pipeline", "06_gorsellestirmeler.py"), False),  # Optional
+    ("07_generate_deliverables", os.path.join("pipeline", "07_generate_deliverables.py"), False),  # Optional (final package)
 ]
 
 
@@ -162,9 +163,11 @@ def main():
         logger.info("  - SHAP feature importance")
         logger.info("  - Kronik ekipman analizi (cok seviyeli)")
         logger.info("  - Survival curves (gorseller/)")
+        logger.info("  - Executive deliverables (Excel + PowerPoint)")
         logger.info("  - Turkce dokumantasyon (OKUBBENI.txt)")
         logger.info("")
         logger.info("Cikti dizini: data/sonuclar/")
+        logger.info("Gorsel dizini: gorseller/")
         logger.info(f"Master log: {log_path}")
         logger.info("=" * 80)
 

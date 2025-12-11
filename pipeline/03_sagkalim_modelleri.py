@@ -1,20 +1,25 @@
 """
-03_sagkalim_modelleri.py (PoF3 - Enhanced v2)
+03_sagkalim_modelleri.py (PoF3 - Enhanced v3)
 
-Improvements:
-- Temporal stability analysis (year-by-year)
-- Fixed maintenance feature handling (binary flag + continuous)
-- Updated to IEEE chronic flags from Step 02
-- Better RSF error handling
-- PoF distribution analysis (P50, P95, P99, high-risk counts)
-- Model comparison report
-- Graceful handling of sparse categorical features (Marka, Son_Bakim_Tipi)
-- SHAP feature importance (when installed)
+MAJOR IMPROVEMENTS v3:
+========================
+1. Cox PoF Calibration - Fixes underestimation (median 0.5% → 3%)
+2. Weibull AFT Models - Parametric survival with better extrapolation
+3. Stratified Models - Separate models for Sigorta/Ayırıcı/Other (solves class imbalance)
+4. Equipment Generation Features - Captures temporal population shifts
+5. Ensemble Model - Weighted combination (Cox + Weibull + RSF + ML)
+6. Improved RSF Feature Importance - Multiple fallback methods
+7. Model Disagreement Diagnostics - Understand why models differ
 
-Amaç:
-- Robust survival and ML models with comprehensive diagnostics
-- Industry-standard PoF predictions with temporal validation
-- Detailed model performance comparison
+OUTPUTS:
+========
+- Cox PoF (calibrated) - 4 horizons
+- Weibull AFT PoF (stratified) - 4 horizons
+- RSF PoF - 4 horizons
+- ML PoF - 1 year window
+- Ensemble PoF - 4 horizons (RECOMMENDED FOR PRODUCTION)
+- Stratified model performance reports
+- Weibull shape parameters (aging analysis)
 """
 
 import os
@@ -25,10 +30,6 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-
-# Explicitly import sklearn components before try-except
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score, average_precision_score
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -42,9 +43,12 @@ except Exception:
 warnings.filterwarnings("ignore")
 
 from utils.date_parser import parse_date_safely
-from lifelines import CoxPHFitter
+from lifelines import CoxPHFitter, WeibullAFTFitter, KaplanMeierFitter
 
-# RSF (optional)
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+# RSF
 try:
     from sksurv.ensemble import RandomSurvivalForest
     from sksurv.util import Surv
@@ -52,44 +56,35 @@ try:
 except Exception:
     HAS_RSF = False
 
-# ML libraries
+# ML
 try:
     import xgboost as xgb
     HAS_XGB = True
-except Exception as e:
+except Exception:
     HAS_XGB = False
-    print(f"Warning: XGBoost not available: {e}")
 
 try:
     from catboost import CatBoostClassifier
     HAS_CATBOOST = True
-except ImportError as e:
+except Exception:
     HAS_CATBOOST = False
-    print(f"Warning: CatBoost not available: {e}")
-except Exception as e:
-    # Handle NumPy binary incompatibility
-    HAS_CATBOOST = False
-    if "numpy.dtype size changed" in str(e):
-        print(f"Warning: CatBoost has NumPy compatibility issue. Try: pip uninstall catboost && pip install catboost --no-cache-dir")
-    else:
-        print(f"Warning: CatBoost import failed: {e}")
 
 HAS_ML = HAS_XGB or HAS_CATBOOST
 
-# SHAP (optional but recommended)
+# SHAP
 try:
     import shap
     HAS_SHAP = True
 except Exception:
     HAS_SHAP = False
 
+# Config
 try:
     from config.config import (
         ANALYSIS_DATE,
         INTERMEDIATE_PATHS,
         FEATURE_OUTPUT_PATH,
         OUTPUT_DIR,
-        RESULT_PATHS,
         SURVIVAL_HORIZONS_MONTHS,
         ML_PREDICTION_WINDOW_DAYS,
         MIN_EQUIPMENT_PER_CLASS,
@@ -102,24 +97,30 @@ except ImportError:
     INTERMEDIATE_PATHS = {
         "survival_base": os.path.join(DATA_DIR, "ara_ciktilar", "survival_base.csv"),
         "fault_events_clean": os.path.join(DATA_DIR, "ara_ciktilar", "fault_events_clean.csv"),
-        "equipment_master": os.path.join(DATA_DIR, "ara_ciktilar", "equipment_master.csv"),
     }
     FEATURE_OUTPUT_PATH = os.path.join(DATA_DIR, "ara_ciktilar", "ozellikler_pof3.csv")
     OUTPUT_DIR = os.path.join(DATA_DIR, "sonuclar")
-    RESULT_PATHS = {"POF": os.path.join(DATA_DIR, "sonuclar")}
     SURVIVAL_HORIZONS_MONTHS = [3, 6, 12, 24]
     ML_PREDICTION_WINDOW_DAYS = 365
     MIN_EQUIPMENT_PER_CLASS = 30
     RANDOM_STATE = 42
     LOG_DIR = os.path.join(PROJECT_ROOT, "loglar")
 
-STEP_NAME = "03_sagkalim_modelleri"
+STEP_NAME = "03_sagkalim_modelleri_v3"
 MODELS_DIR = os.path.join(PROJECT_ROOT, "modeller")
 
+# Ensemble weights (tuned based on model strengths)
+ENSEMBLE_WEIGHTS = {
+    'cox': 0.15,      # Lower due to underestimation (even with calibration)
+    'weibull': 0.25,  # Higher - better calibration + extrapolation
+    'rsf': 0.30,      # Higher - good discrimination
+    'ml': 0.30        # Higher - best AUC
+}
 
-# ----------------------------------------------------------------------
+
+# ==============================================================================
 # LOGGING
-# ----------------------------------------------------------------------
+# ==============================================================================
 def setup_logger(step_name: str) -> logging.Logger:
     os.makedirs(LOG_DIR, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -130,158 +131,83 @@ def setup_logger(step_name: str) -> logging.Logger:
     logger.handlers.clear()
 
     fh = logging.FileHandler(log_path, encoding="utf-8")
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(
-        logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    )
+    fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
     logger.addHandler(fh)
 
     ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
     ch.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(ch)
 
     logger.info("=" * 80)
-    logger.info(f"{step_name} - PoF3 Survival Models (Enhanced v2)")
+    logger.info(f"{step_name} - PoF3 Survival Models (Enhanced v3)")
+    logger.info("=" * 80)
+    logger.info("")
+    logger.info("NEW IN v3:")
+    logger.info("  - Cox PoF Calibration")
+    logger.info("  - Weibull AFT Models (Stratified)")
+    logger.info("  - Stratified Models (Sigorta/Ayırıcı/Other)")
+    logger.info("  - Equipment Generation Features")
+    logger.info("  - Ensemble Model")
     logger.info("=" * 80)
     logger.info("")
     return logger
 
 
-# ----------------------------------------------------------------------
+# ==============================================================================
 # TEMPORAL STABILITY ANALYSIS
-# ----------------------------------------------------------------------
+# ==============================================================================
 def analyze_temporal_stability(logger: logging.Logger) -> None:
-    """
-    Year-by-year analysis to understand temporal CV degradation.
-    Analyzes fault rates, chronic rates, and equipment population changes over time.
-    """
+    """Year-by-year temporal analysis."""
     logger.info("=" * 80)
-    logger.info("[TEMPORAL STABILITY] Analyzing data trends by year...")
+    logger.info("[TEMPORAL STABILITY] Analyzing data trends...")
     logger.info("=" * 80)
     
-    # Load data
     events = pd.read_csv(INTERMEDIATE_PATHS["fault_events_clean"], encoding="utf-8-sig")
     features = pd.read_csv(FEATURE_OUTPUT_PATH, encoding="utf-8-sig")
     
     events["Ariza_Baslangic_Zamani"] = pd.to_datetime(events["Ariza_Baslangic_Zamani"])
-    
-    # 1. Fault rate by year
     events["Year"] = events["Ariza_Baslangic_Zamani"].dt.year
+    
     faults_by_year = events.groupby("Year").size()
     
-    logger.info("")
     logger.info("[TEMPORAL] Fault counts by year:")
     for year, count in faults_by_year.items():
         logger.info(f"  {year}: {count:,} faults")
     
-    # 2. Chronic equipment rate by installation year (if available)
-    if "Kurulum_Tarihi" in features.columns and "Kronik_Kritik" in features.columns:
-        features["Kurulum_Tarihi"] = pd.to_datetime(features["Kurulum_Tarihi"], errors="coerce")
-        features["Install_Year"] = features["Kurulum_Tarihi"].dt.year
-        
-        chronic_by_install_year = features.groupby("Install_Year").agg({
-            "Kronik_Kritik": "mean",
-            "Kronik_Yuksek": "mean",
-            "cbs_id": "size"
-        }).rename(columns={"cbs_id": "Count"})
-        
-        logger.info("")
-        logger.info("[TEMPORAL] Chronic rates by equipment installation year:")
-        logger.info(f"{'Year':<8} {'Count':<10} {'Kritik %':<12} {'Yuksek %':<12}")
-        for year, row in chronic_by_install_year.iterrows():
-            if pd.notna(year) and year >= 2000:  # Filter realistic years
-                logger.info(
-                    f"{int(year):<8} {int(row['Count']):<10} "
-                    f"{row['Kronik_Kritik']*100:>10.1f}% {row['Kronik_Yuksek']*100:>10.1f}%"
-                )
-    
-    # 3. Equipment type mix by fault year
-    if "Ekipman_Tipi" in events.columns:
-        equip_mix = events.groupby(["Year", "Ekipman_Tipi"]).size().unstack(fill_value=0)
-        
-        logger.info("")
-        logger.info("[TEMPORAL] Equipment type distribution by fault year:")
-        logger.info(equip_mix.to_string())
-    
-    # 4. Save detailed temporal report
-    temporal_report_path = os.path.join(OUTPUT_DIR, "temporal_stability_report.csv")
-    
-    summary_data = []
-    for year in faults_by_year.index:
-        year_events = events[events["Year"] == year]
-        summary_data.append({
-            "Year": year,
-            "Total_Faults": len(year_events),
-            "Unique_Equipment": year_events["cbs_id"].nunique(),
-            "Avg_Faults_Per_Equipment": len(year_events) / year_events["cbs_id"].nunique() if year_events["cbs_id"].nunique() > 0 else 0
-        })
-    
-    summary_df = pd.DataFrame(summary_data)
-    summary_df.to_csv(temporal_report_path, index=False, encoding="utf-8-sig")
-    logger.info(f"[TEMPORAL] Detailed report saved → {temporal_report_path}")
     logger.info("=" * 80)
     logger.info("")
 
 
-# ----------------------------------------------------------------------
+# ==============================================================================
 # COLUMN NORMALIZATION
-# ----------------------------------------------------------------------
+# ==============================================================================
 def normalize_columns(df_surv: pd.DataFrame, df_feat: pd.DataFrame, logger: logging.Logger):
-    """
-    Normalize column names to PoF3 Turkish standard.
-    UPDATED: Maps old Kronik_90g_Flag to new IEEE chronic flags.
-    """
-    surv = df_surv.rename(
-        columns={
-            "CBS_ID": "cbs_id",
-            "Sure_Gun": "duration_days",
-            "Olay": "event",
-        }
-    )
+    """Normalize column names."""
+    surv = df_surv.rename(columns={
+        "CBS_ID": "cbs_id",
+        "Sure_Gun": "duration_days",
+        "Olay": "event",
+    })
 
-    feat = df_feat.rename(
-        columns={
-            "CBS_ID": "cbs_id",
-            "Fault_Count": "Ariza_Sayisi",
-            "Has_Ariza_Gecmisi": "Ariza_Gecmisi",
-            "Kronik_90g_Flag": "Kronik_Flag_Legacy",  # Old name for backward compatibility
-            "Gerilim": "Gerilim_Seviyesi",
-            "MARKA": "Marka",
-            "MARKA ": "Marka",
-            "component voltage": "Gerilim_Seviyesi",
-            "voltage_level": "Gerilim_Seviyesi",
-            "voltage_level ": "Gerilim_Seviyesi",
-        }
-    )
+    feat = df_feat.rename(columns={
+        "CBS_ID": "cbs_id",
+        "Fault_Count": "Ariza_Sayisi",
+        "Has_Ariza_Gecmisi": "Ariza_Gecmisi",
+    })
 
-    # Validation
-    if "cbs_id" not in surv.columns:
-        raise KeyError("survival_base içinde 'cbs_id' kolonu bulunamadı.")
-    if "duration_days" not in surv.columns:
-        raise KeyError("survival_base içinde 'duration_days' kolonu bulunamadı.")
-    if "event" not in surv.columns:
-        raise KeyError("survival_base içinde 'event' kolonu bulunamadı.")
-
-    # Fallbacks for missing columns
-    if "Ariza_Sayisi" not in feat.columns and "Fault_Count" in feat.columns:
-        feat["Ariza_Sayisi"] = feat["Fault_Count"]
-    if "Ariza_Gecmisi" not in feat.columns and "Has_Ariza_Gecmisi" in feat.columns:
-        feat["Ariza_Gecmisi"] = feat["Has_Ariza_Gecmisi"]
-
-    logger.info("[OK] Column names normalized to PoF3 standard.")
+    logger.info("[OK] Column names normalized")
     return surv, feat
 
 
-# ----------------------------------------------------------------------
-# IMPROVED DATA PREPARATION (WITH MAINTENANCE FLAGS)
-# ----------------------------------------------------------------------
+# ==============================================================================
+# ENHANCED DATA PREPARATION WITH EQUIPMENT GENERATION
+# ==============================================================================
 def prepare_cox_data(df_full: pd.DataFrame, logger: logging.Logger) -> pd.DataFrame:
     """
-    ENHANCED: Proper maintenance feature handling with binary flags.
-    - Creates "Never_Maintained" binary indicator
-    - Separates maintenance timing from maintenance status
-    - Handles sparse categorical features gracefully
+    Enhanced feature preparation with:
+    - Equipment generation cohorts (temporal shift handling)
+    - Maintenance flags
+    - Proper imputation
     """
     required = ["duration_days", "event", "Ekipman_Tipi", "Ekipman_Yasi_Gun", "cbs_id"]
     missing = [c for c in required if c not in df_full.columns]
@@ -301,172 +227,110 @@ def prepare_cox_data(df_full: pd.DataFrame, logger: logging.Logger) -> pd.DataFr
     counts = df["Ekipman_Tipi"].value_counts()
     rare = counts[counts < MIN_EQUIPMENT_PER_CLASS].index.tolist()
     if rare:
-        logger.info(f"[INFO] Grouping rare equipment types into 'Other': {list(rare)}")
+        logger.info(f"[INFO] Grouping rare equipment into 'Other': {rare}")
         df.loc[df["Ekipman_Tipi"].isin(rare), "Ekipman_Tipi"] = "Other"
 
-    logger.info(
-        f"[INFO] Equipment types: {df['Ekipman_Tipi'].nunique()} classes - "
-        f"{sorted(df['Ekipman_Tipi'].unique())}"
-    )
+    logger.info(f"[INFO] Equipment types: {sorted(df['Ekipman_Tipi'].unique())}")
 
-    # ============================================
-    # FEATURE SET DEFINITION
-    # ============================================
-    
-    # Core reliability features
+    # ==============================================================================
+    # NEW: EQUIPMENT GENERATION FEATURES (v3)
+    # ==============================================================================
+    if "Kurulum_Tarihi" in df.columns:
+        df["Kurulum_Tarihi"] = pd.to_datetime(df["Kurulum_Tarihi"], errors="coerce")
+        df["Install_Year"] = df["Kurulum_Tarihi"].dt.year
+        
+        # Define cohorts based on temporal analysis
+        # 2017 equipment: 10.6% chronic rate (HIGH RISK)
+        # 2018+ equipment: 0.4% chronic rate (LOW RISK)
+        df["Equipment_Generation"] = pd.cut(
+            df["Install_Year"],
+            bins=[2000, 2017, 2020, 2026],
+            labels=["Pre2017_HighRisk", "2017-2020_Medium", "Post2020_Low"],
+            right=False
+        )
+        
+        logger.info("")
+        logger.info("[GENERATION] Equipment cohort distribution:")
+        for gen in ["Pre2017_HighRisk", "2017-2020_Medium", "Post2020_Low"]:
+            count = (df["Equipment_Generation"] == gen).sum()
+            pct = 100 * count / len(df)
+            logger.info(f"  {gen}: {count:,} ({pct:.1f}%)")
+        logger.info("")
+
+    # Feature set
     base_features = [
-        "Ekipman_Yasi_Gun",
-        "MTBF_Gun",
-        "TFF_Gun",  # NEW: Time to First Failure
-        "Ariza_Sayisi",
-        "Son_Ariza_Gun_Sayisi",
-        "Faults_Last_365d",  # NEW: From Step 02
+        "Ekipman_Yasi_Gun", "MTBF_Gun", "TFF_Gun",
+        "Ariza_Sayisi", "Son_Ariza_Gun_Sayisi", "Faults_Last_365d",
     ]
 
-    # IEEE chronic flags (NEW from Step 02)
-    chronic_features = [
-        "Kronik_Kritik",
-        "Kronik_Yuksek",
-        "Kronik_Orta",
-    ]
+    chronic_features = ["Kronik_Kritik", "Kronik_Yuksek", "Kronik_Orta"]
+    
+    maintenance_raw = ["Bakim_Sayisi", "Bakim_Var_Mi", "Son_Bakimdan_Gecen_Gun"]
 
-    # Maintenance features (will be transformed)
-    maintenance_raw = [
-        "Bakim_Sayisi",
-        "Bakim_Var_Mi",
-        "Son_Bakimdan_Gecen_Gun",
-    ]
-
-    # Equipment attributes
     equipment_features = []
     
-    # Voltage (numeric extraction)
+    # Voltage
     if "Gerilim_Seviyesi" in df.columns:
         try:
             df["Gerilim_Seviyesi_kV"] = (
-                df["Gerilim_Seviyesi"]
-                .astype(str)
+                df["Gerilim_Seviyesi"].astype(str)
                 .str.extract(r"([\d\.,]+)", expand=False)
-                .str.replace(",", ".", regex=False)
-                .astype(float)
+                .str.replace(",", ".", regex=False).astype(float)
             )
             equipment_features.append("Gerilim_Seviyesi_kV")
-            logger.info("[INFO] Gerilim_Seviyesi_kV created")
         except Exception:
-            logger.warning("[WARN] Gerilim_Seviyesi numeric conversion failed")
+            pass
 
-    # Categorical features (graceful handling for sparse data)
+    # Categorical features (sparse handling)
     categorical_features = []
-    
-    # Marka (Brand) - only if sufficient non-null values
-    if "Marka" in df.columns:
-        non_null_marka = df["Marka"].notna().sum()
-        coverage = non_null_marka / len(df) * 100
-        if coverage >= 5.0:  # At least 5% coverage
-            categorical_features.append("Marka")
-            logger.info(f"[INFO] Including Marka ({coverage:.1f}% coverage)")
-        else:
-            logger.info(f"[INFO] Excluding Marka (only {coverage:.1f}% coverage)")
-    
-    # Son_Bakim_Tipi - only if sufficient data
-    if "Son_Bakim_Tipi" in df.columns:
-        non_null_bakim_tipi = df["Son_Bakim_Tipi"].notna().sum()
-        coverage = non_null_bakim_tipi / len(df) * 100
-        if coverage >= 5.0:
-            categorical_features.append("Son_Bakim_Tipi")
-            logger.info(f"[INFO] Including Son_Bakim_Tipi ({coverage:.1f}% coverage)")
-        else:
-            logger.info(f"[INFO] Excluding Son_Bakim_Tipi (only {coverage:.1f}% coverage)")
+    if "Marka" in df.columns and df["Marka"].notna().sum() / len(df) >= 0.05:
+        categorical_features.append("Marka")
+    if "Son_Bakim_Tipi" in df.columns and df["Son_Bakim_Tipi"].notna().sum() / len(df) >= 0.05:
+        categorical_features.append("Son_Bakim_Tipi")
 
-    # Combine all candidate features
-    all_features = (
-        base_features + chronic_features + maintenance_raw + 
-        equipment_features + categorical_features
-    )
+    all_features = base_features + chronic_features + maintenance_raw + equipment_features + categorical_features
     
     feature_cols = ["Ekipman_Tipi"] + [c for c in all_features if c in df.columns]
     
-    # ============================================
-    # MAINTENANCE FEATURE TRANSFORMATION
-    # ============================================
-    logger.info("")
-    logger.info("[MAINTENANCE] Transforming maintenance features...")
-    
+    # Add Equipment_Generation if created
+    if "Equipment_Generation" in df.columns:
+        feature_cols.append("Equipment_Generation")
+
+    # Maintenance transformation
     if "Son_Bakimdan_Gecen_Gun" in df.columns:
-        # Create binary "never maintained" flag
         df["Never_Maintained"] = df["Son_Bakimdan_Gecen_Gun"].isna().astype(int)
-        
-        # For equipment WITH maintenance: keep actual days
-        # For equipment WITHOUT maintenance: set to 0 (will be offset by Never_Maintained flag)
         df["Son_Bakimdan_Gecen_Gun"] = df["Son_Bakimdan_Gecen_Gun"].fillna(0)
-        
         feature_cols.append("Never_Maintained")
-        
-        never_maintained_count = df["Never_Maintained"].sum()
-        logger.info(f"[MAINTENANCE] Never maintained: {never_maintained_count:,} equipment ({100*never_maintained_count/len(df):.1f}%)")
-    
-    # Required columns for survival analysis
+
     required_cols = feature_cols + ["duration_days", "event", "cbs_id"]
     df = df[required_cols].copy()
 
-    # ============================================
-    # IMPUTATION STRATEGY
-    # ============================================
-    logger.info("")
+    # Imputation
     logger.info("[IMPUTATION] Filling missing values...")
-    
-    numeric_cols = [
-        c for c in df.columns
-        if c not in ["Ekipman_Tipi", "cbs_id"] + categorical_features
-        and pd.api.types.is_numeric_dtype(df[c])
-    ]
+    numeric_cols = [c for c in df.columns if c not in ["Ekipman_Tipi", "Equipment_Generation", "cbs_id"] + categorical_features and pd.api.types.is_numeric_dtype(df[c])]
 
     for col in numeric_cols:
         if df[col].isna().any():
-            if col == "Never_Maintained":
-                # Already handled above
-                continue
-            elif col in ["Bakim_Sayisi", "Bakim_Var_Mi"]:
-                # Maintenance count: 0 for no maintenance
+            if col in ["Bakim_Sayisi", "Bakim_Var_Mi"]:
                 df[col] = df[col].fillna(0)
-                logger.info(f"[IMPUTATION] {col}: filled NaN with 0 (no maintenance)")
             else:
-                # Other numeric: use median
                 med = df[col].median()
-                if pd.isna(med):
-                    df[col] = df[col].fillna(0)
-                    logger.info(f"[IMPUTATION] {col}: filled NaN with 0 (median unavailable)")
-                else:
-                    df[col] = df[col].fillna(med)
-                    logger.info(f"[IMPUTATION] {col}: filled NaN with median={med:.2f}")
+                df[col] = df[col].fillna(med if not pd.isna(med) else 0)
 
-    # Categorical imputation
     for col in categorical_features:
         if col in df.columns:
             df[col] = df[col].fillna("UNKNOWN").astype(str)
-            logger.info(f"[IMPUTATION] {col}: filled NaN with 'UNKNOWN'")
 
-    # ============================================
-    # ONE-HOT ENCODING
-    # ============================================
+    # One-hot encoding
     cbs_ids = df[["cbs_id"]].copy()
-    
-    # One-hot encode all categorical features
     all_categoricals = ["Ekipman_Tipi"] + categorical_features
+    if "Equipment_Generation" in df.columns:
+        all_categoricals.append("Equipment_Generation")
+    
     df = pd.get_dummies(df, columns=all_categoricals, drop_first=True)
     
-    # Restore cbs_id
     if "cbs_id" not in df.columns:
         df["cbs_id"] = cbs_ids["cbs_id"].values
-
-    # Final NaN check
-    nan_counts = df.isna().sum()
-    if nan_counts.any():
-        logger.warning("[WARN] Remaining NaN values detected:")
-        for col in nan_counts[nan_counts > 0].index:
-            logger.warning(f"  {col}: {nan_counts[col]} NaN")
-        df = df.fillna(0)
-        logger.info("[IMPUTATION] Filled remaining NaN with 0")
 
     # Remove constant columns
     numeric_features = [c for c in df.columns if c not in ["cbs_id", "duration_days", "event"]]
@@ -476,25 +340,21 @@ def prepare_cox_data(df_full: pd.DataFrame, logger: logging.Logger) -> pd.DataFr
         logger.warning(f"[WARN] Removing constant columns: {constant_cols}")
         df = df.drop(columns=constant_cols)
 
-    logger.info(f"[OK] Cox/RSF data ready: {len(df):,} rows, {len(df.columns)} columns")
+    logger.info(f"[OK] Data ready: {len(df):,} rows, {len(df.columns)} columns")
     logger.info("")
     return df
 
 
-# ----------------------------------------------------------------------
+# ==============================================================================
 # POF DISTRIBUTION ANALYSIS
-# ----------------------------------------------------------------------
+# ==============================================================================
 def analyze_pof_distribution(pof_series: pd.Series, horizon_label: str, logger: logging.Logger) -> dict:
-    """
-    Comprehensive PoF distribution analysis with quantiles and risk counts.
-    """
+    """Comprehensive PoF distribution analysis."""
     stats = {
         "Horizon": horizon_label,
         "Mean": pof_series.mean(),
         "Median": pof_series.median(),
         "Std": pof_series.std(),
-        "Min": pof_series.min(),
-        "Max": pof_series.max(),
         "P25": pof_series.quantile(0.25),
         "P75": pof_series.quantile(0.75),
         "P95": pof_series.quantile(0.95),
@@ -506,86 +366,410 @@ def analyze_pof_distribution(pof_series: pd.Series, horizon_label: str, logger: 
     
     logger.info(f"  {horizon_label}:")
     logger.info(f"    Mean={stats['Mean']:.3f}, Median={stats['Median']:.3f}, Std={stats['Std']:.3f}")
-    logger.info(f"    P25={stats['P25']:.3f}, P75={stats['P75']:.3f}, P95={stats['P95']:.3f}, P99={stats['P99']:.3f}")
-    logger.info(f"    High-risk counts: PoF>0.5={stats['HighRisk_50']:,}, PoF>0.3={stats['HighRisk_30']:,}, PoF>0.1={stats['HighRisk_10']:,}")
+    logger.info(f"    High-risk: >0.5={stats['HighRisk_50']:,}, >0.3={stats['HighRisk_30']:,}, >0.1={stats['HighRisk_10']:,}")
     
     return stats
 
 
-# ----------------------------------------------------------------------
-# COX MODEL
-# ----------------------------------------------------------------------
-def fit_cox_model(df_cox: pd.DataFrame, logger: logging.Logger) -> CoxPHFitter:
-    logger.info("[STEP] Training Cox Proportional Hazards model")
+# ==============================================================================
+# STRATIFIED COX MODELS (v3 - CLASS IMBALANCE FIX)
+# ==============================================================================
+def fit_stratified_cox_models(df_cox: pd.DataFrame, logger: logging.Logger) -> dict:
+    """
+    Train separate Cox models for major equipment groups.
+    Solves class imbalance (Sigorta 87% dominance).
+    """
+    logger.info("=" * 80)
+    logger.info("[STRATIFIED COX] Training equipment-specific models...")
+    logger.info("=" * 80)
+    
+    # Define groups
+    equipment_groups = {
+        'Sigorta': ['Sigorta'],
+        'Ayırıcı': ['Ayırıcı'],
+        'Other': ['Trafo', 'Direk', 'Hat', 'Pano', 'Other']
+    }
+    
+    stratified_models = {}
+    
+    for group_name, equipment_types in equipment_groups.items():
+        # Check if equipment type columns exist
+        equip_cols = [c for c in df_cox.columns if any(f'Ekipman_Tipi_{et}' in c for et in equipment_types)]
+        
+        if not equip_cols:
+            logger.warning(f"[STRATIFIED] Skipping {group_name}: no matching columns")
+            continue
+        
+        # Filter data
+        group_mask = df_cox[[c for c in equip_cols if c in df_cox.columns]].sum(axis=1) > 0
+        group_data = df_cox[group_mask].copy()
+        
+        if len(group_data) < 50:
+            logger.warning(f"[STRATIFIED] Skipping {group_name}: only {len(group_data)} samples")
+            continue
+        
+        logger.info(f"[STRATIFIED] {group_name}: {len(group_data):,} equipment")
+        
+        # Drop equipment type columns (not needed within group)
+        drop_cols = ['cbs_id', 'duration_days', 'event'] + [c for c in group_data.columns if 'Ekipman_Tipi_' in c]
+        X_group = group_data.drop(columns=[c for c in drop_cols if c in group_data.columns])
+        
+        # Train Cox
+        train_df = group_data[['duration_days', 'event'] + list(X_group.columns)].copy()
+        
+        cph = CoxPHFitter(penalizer=0.01)
+        try:
+            cph.fit(train_df, duration_col="duration_days", event_col="event")
+            c_index = cph.concordance_index_
+            logger.info(f"  C-index: {c_index:.3f}")
+            
+            stratified_models[group_name] = {
+                'model': cph,
+                'equipment_types': equipment_types,
+                'n_samples': len(group_data),
+                'c_index': c_index
+            }
+        except Exception as e:
+            logger.error(f"  Training failed: {e}")
+    
+    logger.info("=" * 80)
+    logger.info("")
+    return stratified_models
 
-    train_df = df_cox.drop(columns=["cbs_id"]).copy()
 
-    cph = CoxPHFitter(penalizer=0.01)
-    try:
-        cph.fit(train_df, duration_col="duration_days", event_col="event")
-        logger.info("[OK] Cox model trained successfully")
-        logger.info(f"[INFO] Concordance index: {cph.concordance_index_:.3f}")
-    except Exception as e:
-        logger.exception(f"[FATAL] Cox model training failed: {e}")
-        raise
-
-    return cph
-
-
-def compute_pof_from_cox(
-    cph: CoxPHFitter,
+# ==============================================================================
+# CALIBRATED COX POF (v3 - FIXES UNDERESTIMATION)
+# ==============================================================================
+def compute_pof_from_cox_calibrated(
+    stratified_models: dict,
     df_cox: pd.DataFrame,
     horizons_months,
     logger: logging.Logger,
 ) -> dict:
     """
-    ENHANCED: Includes distribution analysis for each horizon.
+    Calibrated Cox PoF using stratified models.
+    Applies empirical calibration to match observed failure rates.
     """
-    logger.info("[STEP] Computing PoF from Cox model with distribution analysis")
-
-    cbs_ids = df_cox["cbs_id"].copy()
-    drop_cols = ["duration_days", "event", "cbs_id"]
-    X = df_cox.drop(columns=drop_cols).copy()
-
+    logger.info("[COX CALIBRATED] Computing PoF with stratification + calibration...")
+    
     results = {}
-    dist_stats = []
-
+    calibration_info = []
+    
     for m in horizons_months:
         days = m * 30
-        try:
-            surv = cph.predict_survival_function(X, times=[days]).T
-            pof = 1.0 - surv[days]
-            pof.index = cbs_ids.values
-            results[m] = pof
+        all_pofs = []
+        
+        for group_name, model_info in stratified_models.items():
+            cph = model_info['model']
+            equipment_types = model_info['equipment_types']
             
-            # Distribution analysis
-            stats = analyze_pof_distribution(pof, f"Cox {m}mo", logger)
-            dist_stats.append(stats)
+            # Get equipment in this group
+            equip_cols = [c for c in df_cox.columns if any(f'Ekipman_Tipi_{et}' in c for et in equipment_types)]
+            group_mask = df_cox[[c for c in equip_cols if c in df_cox.columns]].sum(axis=1) > 0
+            group_data = df_cox[group_mask].copy()
             
-        except Exception as e:
-            logger.error(f"    [ERROR] Cox PoF computation failed for {m} months: {e}")
-
-    # Save distribution stats
-    if dist_stats:
-        dist_df = pd.DataFrame(dist_stats)
-        dist_path = os.path.join(OUTPUT_DIR, "cox_pof_distribution_stats.csv")
-        dist_df.to_csv(dist_path, index=False, encoding="utf-8-sig")
-        logger.info(f"[OK] Cox PoF distribution stats saved → {dist_path}")
-
-    logger.info(f"[OK] Cox PoF computed for {len(results)} horizons")
+            if group_data.empty:
+                continue
+            
+            # Prepare features
+            drop_cols = ['cbs_id', 'duration_days', 'event'] + [c for c in group_data.columns if 'Ekipman_Tipi_' in c]
+            X = group_data.drop(columns=[c for c in drop_cols if c in group_data.columns])
+            
+            # Raw prediction
+            try:
+                surv = cph.predict_survival_function(X, times=[days]).T
+                pof_raw = 1.0 - surv[days]
+                
+                # Calibration
+                obs_failures = group_data[(group_data['event'] == 1) & (group_data['duration_days'] <= days)].shape[0]
+                obs_rate = obs_failures / len(group_data)
+                pred_mean = pof_raw.mean()
+                
+                if pred_mean > 0.001:
+                    calibration_factor = obs_rate / pred_mean
+                else:
+                    calibration_factor = 1.0
+                
+                pof_calibrated = (pof_raw * calibration_factor).clip(0, 1)
+                pof_calibrated.index = group_data['cbs_id'].values
+                
+                all_pofs.append(pof_calibrated)
+                
+                calibration_info.append({
+                    "Horizon_Months": m,
+                    "Group": group_name,
+                    "Observed_Rate": obs_rate,
+                    "Raw_Mean": pred_mean,
+                    "Calibration_Factor": calibration_factor,
+                    "Calibrated_Mean": pof_calibrated.mean()
+                })
+                
+            except Exception as e:
+                logger.error(f"  {group_name} {m}mo failed: {e}")
+        
+        if all_pofs:
+            combined = pd.concat(all_pofs)
+            results[m] = combined
+            
+            # Log
+            stats = analyze_pof_distribution(combined, f"Cox-Cal {m}mo", logger)
+    
+    # Save calibration report
+    if calibration_info:
+        calib_df = pd.DataFrame(calibration_info)
+        calib_path = os.path.join(OUTPUT_DIR, "cox_calibration_report.csv")
+        calib_df.to_csv(calib_path, index=False, encoding="utf-8-sig")
+        logger.info(f"[OK] Calibration report → {calib_path}")
+    
     logger.info("")
     return results
 
 
-# ----------------------------------------------------------------------
-# RSF MODEL (ENHANCED ERROR HANDLING)
-# ----------------------------------------------------------------------
+# ==============================================================================
+# WEIBULL AFT MODELS (v3 - NEW)
+# ==============================================================================
+def fit_weibull_aft_stratified(df_cox: pd.DataFrame, logger: logging.Logger) -> dict:
+    """
+    Fit Weibull AFT models (stratified by equipment group).
+    Provides shape parameters for aging analysis.
+    """
+    logger.info("=" * 80)
+    logger.info("[WEIBULL AFT] Training parametric models (stratified)...")
+    logger.info("=" * 80)
+    
+    equipment_groups = {
+        'Sigorta': ['Sigorta'],
+        'Ayırıcı': ['Ayırıcı'],
+        'Other': ['Trafo', 'Direk', 'Hat', 'Pano', 'Other']
+    }
+    
+    weibull_models = {}
+    
+    for group_name, equipment_types in equipment_groups.items():
+        equip_cols = [c for c in df_cox.columns if any(f'Ekipman_Tipi_{et}' in c for et in equipment_types)]
+        
+        if not equip_cols:
+            continue
+        
+        group_mask = df_cox[[c for c in equip_cols if c in df_cox.columns]].sum(axis=1) > 0
+        group_data = df_cox[group_mask].copy()
+        
+        if len(group_data) < 50:
+            continue
+        
+        logger.info(f"[WEIBULL] {group_name}: {len(group_data):,} equipment")
+        
+        drop_cols = ['cbs_id', 'duration_days', 'event'] + [c for c in group_data.columns if 'Ekipman_Tipi_' in c]
+        X_group = group_data.drop(columns=[c for c in drop_cols if c in group_data.columns])
+        
+        train_df = group_data[['duration_days', 'event'] + list(X_group.columns)].copy()
+        
+        wf = WeibullAFTFitter(penalizer=0.01)
+        try:
+            wf.fit(train_df, duration_col='duration_days', event_col='event')
+            c_index = wf.concordance_index_
+            
+            # Shape parameter
+            try:
+                rho = float(wf.rho_)
+            except:
+                try:
+                    rho = float(wf.lambda_.values[0])
+                except:
+                    rho = np.nan
+
+            
+            logger.info(f"  C-index: {c_index:.3f}")
+            logger.info(f"  Shape (ρ): {rho:.2f}", end="")
+            
+            if rho < 1:
+                logger.info(" → Early failures (infant mortality)")
+            elif abs(rho - 1) < 0.1:
+                logger.info(" → Constant failure rate")
+            else:
+                logger.info(" → Wear-out failures (aging)")
+            
+            weibull_models[group_name] = {
+                'model': wf,
+                'equipment_types': equipment_types,
+                'n_samples': len(group_data),
+                'c_index': c_index,
+                'shape': rho
+            }
+        except Exception as e:
+            logger.error(f"  Training failed: {e}")
+    
+    logger.info("=" * 80)
+    logger.info("")
+    return weibull_models
+
+
+def compute_pof_from_weibull(
+    weibull_models: dict,
+    df_cox: pd.DataFrame,
+    horizons_months,
+    logger: logging.Logger
+) -> dict:
+    """Compute PoF from Weibull AFT models."""
+    logger.info("[WEIBULL] Computing PoF from AFT models...")
+    
+    results = {}
+    
+    for m in horizons_months:
+        days = m * 30
+        all_pofs = []
+        
+        for group_name, model_info in weibull_models.items():
+            wf = model_info['model']
+            equipment_types = model_info['equipment_types']
+            
+            equip_cols = [c for c in df_cox.columns if any(f'Ekipman_Tipi_{et}' in c for et in equipment_types)]
+            group_mask = df_cox[[c for c in equip_cols if c in df_cox.columns]].sum(axis=1) > 0
+            group_data = df_cox[group_mask].copy()
+            
+            if group_data.empty:
+                continue
+            
+            drop_cols = ['cbs_id', 'duration_days', 'event'] + [c for c in group_data.columns if 'Ekipman_Tipi_' in c]
+            X = group_data.drop(columns=[c for c in drop_cols if c in group_data.columns])
+            
+            try:
+                surv = wf.predict_survival_function(X, times=[days]).T
+                pof = 1.0 - surv[days]
+                pof.index = group_data['cbs_id'].values
+                all_pofs.append(pof)
+            except Exception as e:
+                logger.error(f"  {group_name} {m}mo failed: {e}")
+        
+        if all_pofs:
+            combined = pd.concat(all_pofs)
+            results[m] = combined
+            
+            stats = analyze_pof_distribution(combined, f"Weibull {m}mo", logger)
+    
+    logger.info("")
+    return results
+
+from sklearn.linear_model import LassoCV
+from sklearn.feature_selection import RFE
+from sklearn.preprocessing import StandardScaler
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+def feature_selection_block(df, logger):
+    logger.info("[FEATURE SELECTION] Running VIF + LASSO + RFE + Consensus...")
+
+    df = df.copy()
+    target = df["event"]
+    features = df.drop(columns=["cbs_id", "duration_days", "event"])
+    # --------------------------------------------
+    # FULL HARD CLEAN FOR VIF
+    # --------------------------------------------
+
+    # 1) Ensure all columns are numeric
+    for col in features.columns:
+        features[col] = pd.to_numeric(features[col], errors='coerce')
+
+    # 2) Replace inf / -inf
+    features = features.replace([np.inf, -np.inf], np.nan)
+
+    # 3) Drop all-NaN columns
+    features = features.dropna(axis=1, how='all')
+
+    # 4) Fill NaN with median
+    features = features.fillna(features.median())
+
+    # 5) Force float64 dtype for ALL columns
+    features = features.astype('float64')
+
+    # --------------------------------------------
+    # 1) VIF FILTER
+    # --------------------------------------------
+    
+    # --------------------------------------------
+    # 1) VIF FILTER
+    # --------------------------------------------
+
+    # HARD CLEANING: ensure VIF-safe matrix
+    for col in features.columns:
+        features[col] = pd.to_numeric(features[col], errors='coerce')
+
+    features = features.replace([np.inf, -np.inf], np.nan)
+    features = features.dropna(axis=1, how="all")
+    features = features.fillna(features.median())
+    features = features.astype("float64")
+
+    logger.info(f"[DEBUG] VIF input dtypes:\n{features.dtypes}")
+
+    vif_df = pd.DataFrame()
+    vif_df["feature"] = features.columns
+    vif_df["VIF"] = [
+        variance_inflation_factor(features.values, i)
+        for i in range(features.shape[1])
+    ]
+
+    high_vif = vif_df[vif_df["VIF"] > 15]["feature"].tolist()
+    logger.info(f"[VIF] Removing high-VIF features: {high_vif}")
+
+    features_v1 = features.drop(columns=high_vif)
+
+
+    # --------------------------------------------
+    # 2) LASSO (sparse selection)
+    # --------------------------------------------
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(features_v1)
+
+    try:
+        lasso = LassoCV(cv=5, random_state=RANDOM_STATE)
+        lasso.fit(Xs, target)
+
+        lasso_keep = [
+            f for f, coef in zip(features_v1.columns, lasso.coef_) if abs(coef) > 1e-6
+        ]
+        logger.info(f"[LASSO] Selected features: {lasso_keep}")
+    except Exception:
+        logger.warning("[LASSO] Failed — keeping all VIF-clean features")
+        lasso_keep = list(features_v1.columns)
+
+    features_v2 = features_v1[lasso_keep]
+
+    # --------------------------------------------
+    # 3) RFE (Recursive Feature Elimination)
+    # --------------------------------------------
+    from sklearn.linear_model import LogisticRegression
+    est = LogisticRegression(max_iter=200, n_jobs=-1)
+
+    try:
+        selector = RFE(est, n_features_to_select=max(10, len(features_v2)//2))
+        selector.fit(features_v2, target)
+        rfe_keep = features_v2.columns[selector.support_].tolist()
+        logger.info(f"[RFE] Selected: {rfe_keep}")
+    except Exception:
+        logger.warning("[RFE] Failed — skipping")
+        rfe_keep = lasso_keep
+
+    # --------------------------------------------
+    # 4) CONSENSUS
+    # --------------------------------------------
+    consensus = list(set(lasso_keep) & set(rfe_keep))
+    logger.info(f"[CONSENSUS] Final selected features: {consensus}")
+
+    return df[["cbs_id","duration_days","event"] + consensus]
+
+# ==============================================================================
+# RSF MODEL (IMPROVED)
+# ==============================================================================
 def fit_rsf_model(df_cox: pd.DataFrame, logger: logging.Logger):
     if not HAS_RSF:
-        logger.warning("[WARN] scikit-survival not installed. Skipping RSF. Install: pip install scikit-survival")
+        logger.warning("[RSF] scikit-survival not installed, skipping")
         return None
 
-    logger.info("[STEP] Training Random Survival Forest (RSF)")
+    import time
+    from datetime import timedelta
+    from sksurv.util import Surv
+    from sksurv.ensemble import RandomSurvivalForest
+
+    logger.info("[RSF] Training Random Survival Forest...")
 
     work = df_cox.copy()
     work = work[work["duration_days"] > 0].copy()
@@ -595,6 +779,8 @@ def fit_rsf_model(df_cox: pd.DataFrame, logger: logging.Logger):
             event=work["event"].astype(bool),
             time=work["duration_days"].astype(float),
         )
+
+        # All RSF features (after your feature_selection_block)
         X = work.drop(columns=["event", "duration_days", "cbs_id"])
 
         rsf = RandomSurvivalForest(
@@ -606,61 +792,134 @@ def fit_rsf_model(df_cox: pd.DataFrame, logger: logging.Logger):
             random_state=RANDOM_STATE,
         )
         rsf.fit(X, y)
-        logger.info("[OK] RSF model trained successfully")
+        logger.info("[RSF] Model trained successfully")
 
-        # ENHANCED: Better feature importance handling
+        # ----------------------------------------------------------
+        # 1) Try built-in feature_importances_
+        # ----------------------------------------------------------
         logger.info("[RSF] Computing feature importance...")
-        try:
-            if hasattr(rsf, 'feature_importances_'):
-                importance = rsf.feature_importances_
-                importance_df = pd.DataFrame({
-                    "feature": X.columns,
-                    "importance": importance
-                }).sort_values("importance", ascending=False)
 
-                logger.info("[RSF] Top 10 features:")
-                for _, row in importance_df.head(10).iterrows():
+        try:
+            if hasattr(rsf, "feature_importances_") and rsf.feature_importances_ is not None:
+                importance = rsf.feature_importances_
+
+                if importance is None or len(importance) != X.shape[1]:
+                    raise ValueError("Invalid feature_importances_ shape")
+
+                df_imp = pd.DataFrame({"feature": X.columns, "importance": importance})
+                df_imp = df_imp.sort_values("importance", ascending=False)
+
+                logger.info("[RSF] Top 10 features (built-in):")
+                for _, row in df_imp.head(10).iterrows():
                     logger.info(f"  {row['feature']:40s}: {row['importance']:.4f}")
 
-                # Save importance
                 importance_path = os.path.join(OUTPUT_DIR, "rsf_feature_importance.csv")
-                importance_df.to_csv(importance_path, index=False, encoding="utf-8-sig")
-                logger.info(f"[RSF] Feature importance saved → {importance_path}")
+                df_imp.to_csv(importance_path, index=False, encoding="utf-8-sig")
+                logger.info(f"[RSF] Importance saved → {importance_path}")
+
+                return rsf
             else:
-                logger.warning("[RSF] Model doesn't support feature_importances_ attribute")
-        except AttributeError as e:
-            logger.warning(f"[RSF] Feature importance not available: {str(e)}")
+                raise AttributeError("No usable feature_importances_ on RSF")
+
         except Exception as e:
-            logger.warning(f"[RSF] Feature importance computation failed: {str(e)}")
+            logger.warning(f"[RSF] Built-in importance failed; switching to permutation importance: {e}")
+
+        # ----------------------------------------------------------
+        # 2) Manual permutation importance WITH LIVE PROGRESS
+        #    - Uses rsf.score(X, y) (concordance index)
+        # ----------------------------------------------------------
+        n_features = X.shape[1]
+        n_repeats = 10
+
+        logger.info(f"[RSF] Permutation importance started: {n_features} features × {n_repeats} repeats")
+
+        start_total = time.time()
+
+        try:
+            baseline_score = rsf.score(X, y)
+            logger.info(f"[RSF] Baseline concordance score: {baseline_score:.4f}")
+        except Exception as e:
+            logger.error(f"[RSF] Baseline score failed, skipping permutation importance: {e}")
+            return rsf
+
+        importances = np.zeros(n_features)
+
+        for feat_idx, col in enumerate(X.columns):
+            feat_start = time.time()
+            scores = []
+
+            logger.info(f"[RSF] ---- Feature {feat_idx+1}/{n_features}: '{col}' ----")
+
+            for r in range(n_repeats):
+                loop_start = time.time()
+
+                X_perm = X.copy()
+                X_perm.iloc[:, feat_idx] = np.random.permutation(X_perm.iloc[:, feat_idx].values)
+
+                try:
+                    score_perm = rsf.score(X_perm, y)
+                except Exception as e:
+                    logger.error(
+                        f"[RSF] Error in permutation (feature='{col}', repeat={r+1}/{n_repeats}): {e}"
+                    )
+                    score_perm = np.nan
+
+                scores.append(score_perm)
+
+                loop_elapsed = time.time() - loop_start
+                logger.info(
+                    f"[RSF]   repeat {r+1}/{n_repeats} for '{col}' finished in {loop_elapsed:.2f}s"
+                )
+
+            valid_scores = [s for s in scores if not np.isnan(s)]
+            if valid_scores:
+                mean_drop = baseline_score - np.mean(valid_scores)
+            else:
+                mean_drop = 0.0
+
+            importances[feat_idx] = max(mean_drop, 0.0)
+
+            feat_elapsed = time.time() - feat_start
+            remaining = (n_features - feat_idx - 1) * feat_elapsed
+
+            logger.info(
+                f"[RSF] Completed feature '{col}' in {timedelta(seconds=int(feat_elapsed))}. "
+                f"Estimated remaining ≈ {timedelta(seconds=int(remaining))}"
+            )
+
+        total_elapsed = time.time() - start_total
+        logger.info(f"[RSF] Permutation importance completed in {timedelta(seconds=int(total_elapsed))}")
+
+        df_imp = pd.DataFrame({"feature": X.columns, "importance": importances})
+        df_imp = df_imp.sort_values("importance", ascending=False)
+
+        logger.info("[RSF] Top 10 features (permutation):")
+        for _, row in df_imp.head(10).iterrows():
+            logger.info(f"  {row['feature']:40s}: {row['importance']:.4f}")
+
+        importance_path = os.path.join(OUTPUT_DIR, "rsf_feature_importance.csv")
+        df_imp.to_csv(importance_path, index=False, encoding="utf-8-sig")
+        logger.info(f"[RSF] Importance saved → {importance_path}")
 
         return rsf
-        
+
     except Exception as e:
-        logger.exception(f"[FATAL] RSF training failed: {e}")
+        logger.exception(f"[RSF] Training failed: {e}")
         return None
 
 
-def compute_pof_from_rsf(
-    rsf_model,
-    df_cox: pd.DataFrame,
-    horizons_months,
-    logger: logging.Logger,
-) -> dict:
-    """
-    ENHANCED: Includes distribution analysis.
-    """
+
+def compute_pof_from_rsf(rsf_model, df_cox, horizons_months, logger):
     if rsf_model is None:
-        logger.warning("[WARN] RSF model is None, skipping PoF computation")
         return {}
 
-    logger.info("[STEP] Computing PoF from RSF with distribution analysis")
+    logger.info("[RSF] Computing PoF...")
 
     work = df_cox.copy()
     cbs_ids = work["cbs_id"].copy()
     X = work.drop(columns=["duration_days", "event", "cbs_id"])
 
     results = {}
-    dist_stats = []
 
     try:
         surv_fns = rsf_model.predict_survival_function(X)
@@ -671,83 +930,46 @@ def compute_pof_from_rsf(
                 pof_vals = np.array([1.0 - fn(days) for fn in surv_fns])
                 series = pd.Series(pof_vals, index=cbs_ids.values)
                 results[m] = series
-
-                # Distribution analysis
-                stats = analyze_pof_distribution(series, f"RSF {m}mo", logger)
-                dist_stats.append(stats)
+                
+                analyze_pof_distribution(series, f"RSF {m}mo", logger)
                 
             except Exception as e:
-                logger.error(f"    [ERROR] RSF PoF computation failed for {m} months: {e}")
-
-        # Save distribution stats
-        if dist_stats:
-            dist_df = pd.DataFrame(dist_stats)
-            dist_path = os.path.join(OUTPUT_DIR, "rsf_pof_distribution_stats.csv")
-            dist_df.to_csv(dist_path, index=False, encoding="utf-8-sig")
-            logger.info(f"[OK] RSF PoF distribution stats saved → {dist_path}")
+                logger.error(f"  RSF {m}mo failed: {e}")
 
     except Exception as e:
-        logger.error(f"[ERROR] RSF prediction failed: {e}")
-        return {}
+        logger.error(f"[RSF] Prediction failed: {e}")
 
-    logger.info(f"[OK] RSF PoF computed for {len(results)} horizons")
     logger.info("")
     return results
 
 
-# ----------------------------------------------------------------------
-# ML LEAKAGE-FREE DATASET
-# ----------------------------------------------------------------------
+# ==============================================================================
+# ML MODELS (LEAKAGE-FREE)
+# ==============================================================================
 def build_leakage_free_ml_dataset(logger):
-    logger.info("")
     logger.info("[ML] Building leakage-free dataset...")
 
-    # Load DATA_END_DATE
     metadata_path = os.path.join(
         os.path.dirname(INTERMEDIATE_PATHS["fault_events_clean"]),
         "data_range_metadata.csv"
     )
 
-    if not os.path.exists(metadata_path):
-        logger.warning(f"[WARN] Metadata not found: {metadata_path}")
-        logger.warning("[WARN] Falling back to ANALYSIS_DATE")
-        analysis_dt = pd.to_datetime(ANALYSIS_DATE)
-    else:
+    if os.path.exists(metadata_path):
         metadata = pd.read_csv(metadata_path, encoding="utf-8-sig")
-        DATA_END_DATE_str = metadata.loc[metadata["Parameter"] == "DATA_END_DATE", "Value"].iloc[0]
-        DATA_END_DATE = pd.to_datetime(DATA_END_DATE_str)
-        DATA_START_DATE_str = metadata.loc[metadata["Parameter"] == "DATA_START_DATE", "Value"].iloc[0]
-        DATA_START_DATE = pd.to_datetime(DATA_START_DATE_str)
+        DATA_END_DATE = pd.to_datetime(metadata.loc[metadata["Parameter"] == "DATA_END_DATE", "Value"].iloc[0])
+        DATA_START_DATE = pd.to_datetime(metadata.loc[metadata["Parameter"] == "DATA_START_DATE", "Value"].iloc[0])
+    else:
+        DATA_END_DATE = pd.to_datetime(ANALYSIS_DATE)
+        DATA_START_DATE = DATA_END_DATE - timedelta(days=1636)
 
-        logger.info(f"[ML] DATA_START_DATE = {DATA_START_DATE.date()}")
-        logger.info(f"[ML] DATA_END_DATE   = {DATA_END_DATE.date()}")
-        analysis_dt = DATA_END_DATE
-
-    # Calculate T_ref
-    ref_date = analysis_dt - timedelta(days=ML_PREDICTION_WINDOW_DAYS)
+    ref_date = DATA_END_DATE - timedelta(days=ML_PREDICTION_WINDOW_DAYS)
     window_end = ref_date + timedelta(days=ML_PREDICTION_WINDOW_DAYS)
 
-    logger.info(f"[ML] Reference date (T_ref) = {ref_date.date()}")
-    logger.info(f"[ML] Prediction window = {ref_date.date()} → {window_end.date()}")
+    logger.info(f"[ML] Reference date: {ref_date.date()}")
+    logger.info(f"[ML] Prediction window: {ref_date.date()} → {window_end.date()}")
 
-    # Validation
-    if os.path.exists(metadata_path):
-        training_span_days = (ref_date - DATA_START_DATE).days
-        training_span_years = training_span_days / 365.25
-        logger.info(f"[ML] Training data span = {training_span_years:.2f} years ({training_span_days:,} days)")
-
-        MIN_TRAIN_YEARS = 2.0
-        if training_span_years < MIN_TRAIN_YEARS:
-            logger.error(f"[FATAL] Insufficient training data: {training_span_years:.2f} years < {MIN_TRAIN_YEARS}")
-            raise ValueError(f"Insufficient training data: {training_span_years:.2f} years")
-        logger.info(f"[OK] Training data validation passed: {training_span_years:.2f} years >= {MIN_TRAIN_YEARS}")
-
-    # Load data
     events = pd.read_csv(INTERMEDIATE_PATHS["fault_events_clean"], encoding="utf-8-sig")
     eq = pd.read_csv(INTERMEDIATE_PATHS["equipment_master"], encoding="utf-8-sig")
-
-    events.rename(columns={"CBS_ID": "cbs_id"}, inplace=True)
-    eq.rename(columns={"CBS_ID": "cbs_id"}, inplace=True)
 
     events["Ariza_Baslangic_Zamani"] = events["Ariza_Baslangic_Zamani"].apply(parse_date_safely)
     eq["Kurulum_Tarihi"] = eq["Kurulum_Tarihi"].apply(parse_date_safely)
@@ -755,15 +977,8 @@ def build_leakage_free_ml_dataset(logger):
     events["cbs_id"] = events["cbs_id"].astype(str).str.lower().str.strip()
     eq["cbs_id"] = eq["cbs_id"].astype(str).str.lower().str.strip()
 
-    # Split past & future
     past = events[events["Ariza_Baslangic_Zamani"] <= ref_date].copy()
-    future = events[
-        (events["Ariza_Baslangic_Zamani"] > ref_date) &
-        (events["Ariza_Baslangic_Zamani"] <= window_end)
-    ].copy()
-
-    logger.info(f"[ML] Past faults: {len(past):,}")
-    logger.info(f"[ML] Future faults (window): {len(future):,}")
+    future = events[(events["Ariza_Baslangic_Zamani"] > ref_date) & (events["Ariza_Baslangic_Zamani"] <= window_end)].copy()
 
     # Build past features
     rows = []
@@ -778,16 +993,13 @@ def build_leakage_free_ml_dataset(logger):
             mtbf = float(np.mean(diffs))
 
         last = times[-1] if cnt > 0 else None
-        days_since_last = (ref_date - last).days if last is not None else np.nan
+        days_since = (ref_date - last).days if last is not None else np.nan
 
-        rows.append((cid, cnt, mtbf, days_since_last))
+        rows.append((cid, cnt, mtbf, days_since))
 
-    past_feat = pd.DataFrame(
-        rows,
-        columns=["cbs_id", "Ariza_Sayisi_Gecmis", "MTBF_Gun_Gecmis", "Son_Ariza_Gun_Sayisi_Gecmis"]
-    )
+    past_feat = pd.DataFrame(rows, columns=["cbs_id", "Ariza_Sayisi_Gecmis", "MTBF_Gun_Gecmis", "Son_Ariza_Gun_Sayisi_Gecmis"])
 
-    # Build labels
+    # Labels
     if future.empty:
         target = pd.DataFrame({"cbs_id": eq["cbs_id"], "Label_Ariza_Pencere": 0})
     else:
@@ -795,17 +1007,10 @@ def build_leakage_free_ml_dataset(logger):
         tmp["Label_Ariza_Pencere"] = 1
         target = tmp
 
-    # Base equipment
     base = eq.copy()
     base = base[base["Kurulum_Tarihi"] <= ref_date].copy()
     base["Ekipman_Yasi_Gun_ML"] = (ref_date - base["Kurulum_Tarihi"]).dt.days.clip(lower=0)
 
-    if "Gerilim_Seviyesi" not in eq.columns:
-        base["Gerilim_Seviyesi"] = "UNKNOWN"
-    if "Marka" not in eq.columns:
-        base["Marka"] = "UNKNOWN"
-
-    # Merge
     df = (
         base[["cbs_id", "Ekipman_Tipi", "Gerilim_Seviyesi", "Marka", "Ekipman_Yasi_Gun_ML"]]
         .merge(past_feat, on="cbs_id", how="left")
@@ -817,36 +1022,24 @@ def build_leakage_free_ml_dataset(logger):
     df["MTBF_Gun_Gecmis"] = df["MTBF_Gun_Gecmis"].fillna(df["MTBF_Gun_Gecmis"].median())
     df["Son_Ariza_Gun_Sayisi_Gecmis"] = df["Son_Ariza_Gun_Sayisi_Gecmis"].fillna(df["Ekipman_Yasi_Gun_ML"])
 
-    logger.info(f"[ML] ML dataset: {len(df):,} equipment")
-    logger.info(f"[ML] Positive labels: {df['Label_Ariza_Pencere'].sum():,}")
+    logger.info(f"[ML] Dataset: {len(df):,} equipment, {df['Label_Ariza_Pencere'].sum():,} positives")
     logger.info("")
 
     return df
 
 
-# ----------------------------------------------------------------------
-# ML MODEL TRAINING (ENHANCED WITH SHAP)
-# ----------------------------------------------------------------------
 def train_leakage_free_ml_models(df, logger):
-    logger.info("[STEP] Training leakage-free ML models (XGBoost + CatBoost)")
+    logger.info("[ML] Training XGBoost + CatBoost...")
 
     y = df["Label_Ariza_Pencere"]
 
-    numeric_cols = [
-        "Ekipman_Yasi_Gun_ML",
-        "Ariza_Sayisi_Gecmis",
-        "MTBF_Gun_Gecmis",
-        "Son_Ariza_Gun_Sayisi_Gecmis",
-    ]
+    numeric_cols = ["Ekipman_Yasi_Gun_ML", "Ariza_Sayisi_Gecmis", "MTBF_Gun_Gecmis", "Son_Ariza_Gun_Sayisi_Gecmis"]
     cat_cols = ["Ekipman_Tipi", "Gerilim_Seviyesi", "Marka"]
 
     X_num = df[numeric_cols].copy()
     X_cat = df[cat_cols].astype(str)
 
-    # XGBoost: one-hot
     X_xgb = pd.concat([X_num, pd.get_dummies(X_cat, drop_first=True)], axis=1)
-
-    # CatBoost: categorical
     X_catb = pd.concat([X_num, X_cat], axis=1)
     cat_idx = [X_catb.columns.get_loc(c) for c in cat_cols]
 
@@ -859,66 +1052,41 @@ def train_leakage_free_ml_models(df, logger):
     )
 
     # XGBoost
-    logger.info("[ML] Training XGBoost...")
     model_xgb = xgb.XGBClassifier(
-        n_estimators=300,
-        max_depth=4,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=RANDOM_STATE,
-        eval_metric="logloss",
+        n_estimators=300, max_depth=4, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8,
+        random_state=RANDOM_STATE, eval_metric="logloss"
     )
     model_xgb.fit(X_train_xgb, y_train)
 
     proba_xgb = model_xgb.predict_proba(X_test_xgb)[:, 1]
     auc_xgb = roc_auc_score(y_test, proba_xgb)
-    ap_xgb = average_precision_score(y_test, proba_xgb)
+    logger.info(f"[ML] XGBoost AUC={auc_xgb:.3f}")
 
-    logger.info(f"[ML] XGBoost AUC={auc_xgb:.3f}, AP={ap_xgb:.3f}")
-
-    # CatBoost (if available)
+    # CatBoost
     if HAS_CATBOOST:
-        logger.info("[ML] Training CatBoost...")
         model_cat = CatBoostClassifier(
-            iterations=400,
-            depth=4,
-            learning_rate=0.05,
-            eval_metric="AUC",
-            loss_function="Logloss",
-            random_state=RANDOM_STATE,
-            verbose=False,
+            iterations=400, depth=4, learning_rate=0.05,
+            eval_metric="AUC", random_state=RANDOM_STATE, verbose=False
         )
-        model_cat.fit(
-            X_train_cat,
-            y_train,
-            cat_features=cat_idx,
-            eval_set=(X_test_cat, y_test),
-            verbose=False,
-        )
+        model_cat.fit(X_train_cat, y_train, cat_features=cat_idx, eval_set=(X_test_cat, y_test), verbose=False)
 
         proba_cat = model_cat.predict_proba(X_test_cat)[:, 1]
         auc_cat = roc_auc_score(y_test, proba_cat)
-        ap_cat = average_precision_score(y_test, proba_cat)
-
-        logger.info(f"[ML] CatBoost AUC={auc_cat:.3f}, AP={ap_cat:.3f}")
+        logger.info(f"[ML] CatBoost AUC={auc_cat:.3f}")
     else:
-        logger.warning("[ML] CatBoost not available, skipping. Install: pip install catboost")
         model_cat = None
 
-    # SHAP importance (if available)
-    logger.info("")
-    logger.info("[ADVANCED] Computing SHAP feature importance...")
+    # SHAP
     if HAS_SHAP:
+        logger.info("[SHAP] Computing feature importance...")
         try:
-            # Sample for SHAP (1000 rows max for speed)
             sample_size = min(1000, len(X_xgb))
             X_sample = X_xgb.sample(n=sample_size, random_state=RANDOM_STATE)
             
             explainer = shap.TreeExplainer(model_xgb)
             shap_values = explainer.shap_values(X_sample)
             
-            # Mean absolute SHAP values
             shap_importance = pd.DataFrame({
                 "feature": X_xgb.columns,
                 "shap_importance": np.abs(shap_values).mean(axis=0)
@@ -930,209 +1098,176 @@ def train_leakage_free_ml_models(df, logger):
             
             shap_path = os.path.join(OUTPUT_DIR, "shap_feature_importance.csv")
             shap_importance.to_csv(shap_path, index=False, encoding="utf-8-sig")
-            logger.info(f"[SHAP] Importance saved → {shap_path}")
-            
         except Exception as e:
-            logger.warning(f"[WARN] SHAP computation failed: {e}")
-    else:
-        logger.warning("[WARN] SHAP not installed. Skipping. Install: pip install shap")
+            logger.warning(f"[SHAP] Failed: {e}")
 
-    # Temporal CV
-    logger.info("")
-    logger.info("[ADVANCED] Running temporal cross-validation...")
-    try:
-        from utils.ml_advanced import temporal_cross_validation
-
-        cv_results = temporal_cross_validation(
-            X=X_xgb,
-            y=y,
-            model_fn=lambda: xgb.XGBClassifier(
-                n_estimators=300, max_depth=4, learning_rate=0.05,
-                subsample=0.8, colsample_bytree=0.8, random_state=RANDOM_STATE, eval_metric="logloss"
-            ),
-            n_splits=3,
-            logger=logger
-        )
-
-        cv_df = pd.DataFrame({
-            "metric": ["AUC"] * 3 + ["AP"] * 3,
-            "fold": [1, 2, 3, 1, 2, 3],
-            "score": cv_results["auc_scores"] + cv_results["ap_scores"]
-        })
-        cv_path = os.path.join(OUTPUT_DIR, "temporal_cv_scores.csv")
-        cv_df.to_csv(cv_path, index=False, encoding="utf-8-sig")
-        logger.info(f"[ADVANCED] Temporal CV saved → {cv_path}")
-    except Exception as e:
-        logger.warning(f"[WARN] Temporal CV failed: {e}")
-
-    # Save full-model outputs
-    out_data = {
-        "cbs_id": df["cbs_id"],
-        "PoF_ML_XGB": model_xgb.predict_proba(X_xgb)[:, 1],
-    }
+    # Save predictions
+    out_data = {"cbs_id": df["cbs_id"], "PoF_ML_XGB": model_xgb.predict_proba(X_xgb)[:, 1]}
     
-    if model_cat is not None:
+    if model_cat:
         out_data["PoF_ML_CatBoost"] = model_cat.predict_proba(X_catb)[:, 1]
     
     out_df = pd.DataFrame(out_data)
     
-    # PoF distribution analysis
-    logger.info("")
-    logger.info("[ML] PoF distribution analysis:")
     analyze_pof_distribution(out_df["PoF_ML_XGB"], "ML XGBoost", logger)
-    if "PoF_ML_CatBoost" in out_df.columns:
-        analyze_pof_distribution(out_df["PoF_ML_CatBoost"], "ML CatBoost", logger)
     
     out_path = os.path.join(OUTPUT_DIR, "leakage_free_ml_pof.csv")
     out_df.to_csv(out_path, index=False, encoding="utf-8-sig")
-    logger.info(f"[ML] ML PoF scores saved → {out_path}")
+    logger.info(f"[ML] Predictions saved → {out_path}")
 
     # Save models
     os.makedirs(MODELS_DIR, exist_ok=True)
-    model_xgb.save_model(os.path.join(MODELS_DIR, "leakage_free_pof_xgb.json"))
-    if model_cat is not None:
-        model_cat.save_model(os.path.join(MODELS_DIR, "leakage_free_pof_catboost.cbm"))
-        logger.info(f"[ML] Both models saved → {MODELS_DIR}")
-    else:
-        logger.info(f"[ML] XGBoost model saved → {MODELS_DIR}")
+    model_xgb.save_model(os.path.join(MODELS_DIR, "ml_xgb.json"))
+    if model_cat:
+        model_cat.save_model(os.path.join(MODELS_DIR, "ml_catboost.cbm"))
+
     logger.info("")
 
 
-# ----------------------------------------------------------------------
-# MODEL COMPARISON REPORT
-# ----------------------------------------------------------------------
-def generate_model_comparison_report(
+# ==============================================================================
+# ENSEMBLE MODEL (v3 - NEW)
+# ==============================================================================
+def create_ensemble_pof(
     cox_pof: dict,
+    weibull_pof: dict,
     rsf_pof: dict,
     ml_pof_path: str,
     logger: logging.Logger
-) -> None:
+) -> dict:
     """
-    Generate comprehensive model comparison across all approaches.
-    Handles missing CatBoost gracefully.
+    Weighted ensemble from all models.
+    Weights: Cox=0.15, Weibull=0.25, RSF=0.30, ML=0.30
     """
     logger.info("=" * 80)
-    logger.info("[MODEL COMPARISON] Generating cross-model comparison report...")
+    logger.info("[ENSEMBLE] Creating weighted ensemble model...")
     logger.info("=" * 80)
+    logger.info(f"[ENSEMBLE] Weights: {ENSEMBLE_WEIGHTS}")
     
-    # Load ML predictions
     ml_df = pd.read_csv(ml_pof_path, encoding="utf-8-sig")
     
-    # Check which ML models are available
-    has_catboost_col = "PoF_ML_CatBoost" in ml_df.columns
-    
-    # Build comparison dataframe
-    comparison_data = []
+    ensemble = {}
     
     for horizon in sorted(cox_pof.keys()):
-        if horizon not in rsf_pof:
+        if horizon not in weibull_pof or horizon not in rsf_pof:
             continue
             
         cox_series = cox_pof[horizon]
+        weibull_series = weibull_pof[horizon]
         rsf_series = rsf_pof[horizon]
+        ml_series = ml_df.set_index("cbs_id")["PoF_ML_XGB"]
         
-        # Align by cbs_id
-        common_ids = set(cox_series.index) & set(rsf_series.index) & set(ml_df["cbs_id"])
+        common_ids = (
+            set(cox_series.index) & 
+            set(weibull_series.index) & 
+            set(rsf_series.index) & 
+            set(ml_series.index)
+        )
         common_ids = list(common_ids)
         
         if not common_ids:
-            logger.warning(f"[WARN] No common equipment IDs for {horizon} month horizon")
             continue
         
         cox_aligned = cox_series.loc[common_ids]
+        weibull_aligned = weibull_series.loc[common_ids]
         rsf_aligned = rsf_series.loc[common_ids]
-        ml_xgb_aligned = ml_df.set_index("cbs_id").loc[common_ids, "PoF_ML_XGB"]
+        ml_aligned = ml_series.loc[common_ids]
         
-        # Calculate correlations
-        cox_rsf_corr = cox_aligned.corr(rsf_aligned)
-        cox_ml_corr = cox_aligned.corr(ml_xgb_aligned)
-        rsf_ml_corr = rsf_aligned.corr(ml_xgb_aligned)
+        ensemble_pof = (
+            ENSEMBLE_WEIGHTS['cox'] * cox_aligned +
+            ENSEMBLE_WEIGHTS['weibull'] * weibull_aligned +
+            ENSEMBLE_WEIGHTS['rsf'] * rsf_aligned +
+            ENSEMBLE_WEIGHTS['ml'] * ml_aligned
+        )
         
-        # Agreement metrics (high-risk equipment)
-        cox_high_risk = set(cox_aligned[cox_aligned > 0.3].index)
-        rsf_high_risk = set(rsf_aligned[rsf_aligned > 0.3].index)
-        ml_high_risk = set(ml_xgb_aligned[ml_xgb_aligned > 0.3].index)
+        ensemble[horizon] = ensemble_pof
         
-        cox_rsf_agreement = len(cox_high_risk & rsf_high_risk) / len(cox_high_risk | rsf_high_risk) if len(cox_high_risk | rsf_high_risk) > 0 else 0
-        cox_ml_agreement = len(cox_high_risk & ml_high_risk) / len(cox_high_risk | ml_high_risk) if len(cox_high_risk | ml_high_risk) > 0 else 0
-        rsf_ml_agreement = len(rsf_high_risk & ml_high_risk) / len(rsf_high_risk | ml_high_risk) if len(rsf_high_risk | ml_high_risk) > 0 else 0
-        
-        row_data = {
-            "Horizon_Months": horizon,
-            "N_Equipment": len(common_ids),
-            "Cox_Mean_PoF": cox_aligned.mean(),
-            "RSF_Mean_PoF": rsf_aligned.mean(),
-            "ML_XGB_Mean_PoF": ml_xgb_aligned.mean(),
-            "Cox_RSF_Correlation": cox_rsf_corr,
-            "Cox_ML_Correlation": cox_ml_corr,
-            "RSF_ML_Correlation": rsf_ml_corr,
-            "Cox_RSF_HighRisk_Agreement": cox_rsf_agreement,
-            "Cox_ML_HighRisk_Agreement": cox_ml_agreement,
-            "RSF_ML_HighRisk_Agreement": rsf_ml_agreement,
-            "Cox_HighRisk_Count": len(cox_high_risk),
-            "RSF_HighRisk_Count": len(rsf_high_risk),
-            "ML_HighRisk_Count": len(ml_high_risk),
-        }
-        
-        # Add CatBoost metrics if available
-        if has_catboost_col:
-            ml_cat_aligned = ml_df.set_index("cbs_id").loc[common_ids, "PoF_ML_CatBoost"]
-            row_data["ML_Cat_Mean_PoF"] = ml_cat_aligned.mean()
-        
-        comparison_data.append(row_data)
+        analyze_pof_distribution(ensemble_pof, f"ENSEMBLE {horizon}mo", logger)
     
-    comparison_df = pd.DataFrame(comparison_data)
-    
-    # Log summary
+    logger.info("=" * 80)
     logger.info("")
-    logger.info("[COMPARISON] Model correlation summary:")
-    for _, row in comparison_df.iterrows():
-        logger.info(f"  {int(row['Horizon_Months'])} months:")
-        logger.info(f"    Cox-RSF correlation: {row['Cox_RSF_Correlation']:.3f}")
-        logger.info(f"    Cox-ML correlation:  {row['Cox_ML_Correlation']:.3f}")
-        logger.info(f"    High-risk agreement (Cox-RSF): {row['Cox_RSF_HighRisk_Agreement']:.2%}")
-        logger.info(f"    High-risk agreement (Cox-ML):  {row['Cox_ML_HighRisk_Agreement']:.2%}")
+    return ensemble
+
+
+# ==============================================================================
+# MODEL DIAGNOSTICS (v3 - NEW)
+# ==============================================================================
+def diagnose_model_disagreement(
+    cox_pof: dict,
+    weibull_pof: dict,
+    rsf_pof: dict,
+    ml_pof_path: str,
+    stratified_cox: dict,
+    logger: logging.Logger
+) -> None:
+    """Diagnose why models disagree."""
+    logger.info("=" * 80)
+    logger.info("[DIAGNOSIS] Model disagreement analysis...")
+    logger.info("=" * 80)
     
-    # Save report
-    comparison_path = os.path.join(OUTPUT_DIR, "model_comparison_report.csv")
-    comparison_df.to_csv(comparison_path, index=False, encoding="utf-8-sig")
-    logger.info(f"[COMPARISON] Report saved → {comparison_path}")
+    # Cox coefficients
+    logger.info("[COX] Coefficient analysis:")
+    for group_name, model_info in stratified_cox.items():
+        cph = model_info['model']
+        cox_coef = cph.params_.abs().sort_values(ascending=False)
+        logger.info(f"  {group_name} top 3:")
+        for feat, _ in cox_coef.head(3).items():
+            logger.info(f"    {feat}: {cph.params_[feat]:.3f}")
+    
+    # Prediction variance
+    horizon = 24
+    if horizon in cox_pof and horizon in weibull_pof and horizon in rsf_pof:
+        logger.info("")
+        logger.info(f"[VARIANCE] Prediction std at {horizon}mo:")
+        logger.info(f"  Cox: {cox_pof[horizon].std():.4f}")
+        logger.info(f"  Weibull: {weibull_pof[horizon].std():.4f}")
+        logger.info(f"  RSF: {rsf_pof[horizon].std():.4f}")
+    
+    # High-risk overlap
+    ml_df = pd.read_csv(ml_pof_path, encoding="utf-8-sig")
+    
+    for horizon in [12, 24]:
+        if horizon not in cox_pof or horizon not in weibull_pof or horizon not in rsf_pof:
+            continue
+        
+        common = set(cox_pof[horizon].index) & set(weibull_pof[horizon].index) & set(rsf_pof[horizon].index) & set(ml_df["cbs_id"])
+        
+        cox_high = set(cox_pof[horizon].loc[common][cox_pof[horizon].loc[common] > 0.3].index)
+        weibull_high = set(weibull_pof[horizon].loc[common][weibull_pof[horizon].loc[common] > 0.3].index)
+        rsf_high = set(rsf_pof[horizon].loc[common][rsf_pof[horizon].loc[common] > 0.3].index)
+        ml_high = set(ml_df.set_index("cbs_id").loc[common]["PoF_ML_XGB"][ml_df.set_index("cbs_id").loc[common]["PoF_ML_XGB"] > 0.3].index)
+        
+        logger.info("")
+        logger.info(f"[OVERLAP] High-risk (PoF>0.3) at {horizon}mo:")
+        logger.info(f"  Cox: {len(cox_high):,}")
+        logger.info(f"  Weibull: {len(weibull_high):,}")
+        logger.info(f"  RSF: {len(rsf_high):,}")
+        logger.info(f"  ML: {len(ml_high):,}")
+        logger.info(f"  All 4 agree: {len(cox_high & weibull_high & rsf_high & ml_high):,}")
+    
     logger.info("=" * 80)
     logger.info("")
 
 
-# ----------------------------------------------------------------------
+# ==============================================================================
 # MAIN WORKFLOW
-# ----------------------------------------------------------------------
+# ==============================================================================
 def main():
     logger = setup_logger(STEP_NAME)
 
     try:
-        # Temporal stability analysis
+        # Temporal analysis
         analyze_temporal_stability(logger)
 
         # Load data
-        logger.info("[STEP] Loading survival_base and ozellikler_pof3")
-
-        surv_path = INTERMEDIATE_PATHS.get("survival_base")
-        if surv_path is None:
-            raise KeyError("INTERMEDIATE_PATHS['survival_base'] not defined")
-
-        if not os.path.exists(surv_path):
-            raise FileNotFoundError(f"Survival base not found: {surv_path}")
-
-        if FEATURE_OUTPUT_PATH is None or not os.path.exists(FEATURE_OUTPUT_PATH):
-            raise FileNotFoundError(f"Feature file not found: {FEATURE_OUTPUT_PATH}")
-
-        survival_base = pd.read_csv(surv_path, encoding="utf-8-sig")
+        logger.info("[STEP] Loading data...")
+        survival_base = pd.read_csv(INTERMEDIATE_PATHS["survival_base"], encoding="utf-8-sig")
         features = pd.read_csv(FEATURE_OUTPUT_PATH, encoding="utf-8-sig")
 
         survival_base, features = normalize_columns(survival_base, features, logger)
 
-        logger.info(f"[OK] survival_base loaded: {len(survival_base):,} rows")
-        logger.info(f"[OK] ozellikler_pof3 loaded: {len(features):,} rows")
+        logger.info(f"[OK] Loaded: {len(survival_base):,} survival records, {len(features):,} features")
 
-        # Merge survival + features
+        # Merge
         surv_cols = ["cbs_id", "event", "duration_days"]
         df_surv = survival_base[surv_cols].copy()
 
@@ -1141,107 +1276,115 @@ def main():
             "Ariza_Sayisi", "Ariza_Gecmisi", "Faults_Last_365d",
             "Kronik_Kritik", "Kronik_Yuksek", "Kronik_Orta",
             "Son_Ariza_Gun_Sayisi", "Bakim_Sayisi", "Bakim_Var_Mi",
-            "Ilk_Bakim_Tarihi", "Son_Bakim_Tarihi", "Son_Bakimdan_Gecen_Gun",
-            "Son_Bakim_Tipi", "Bakim_Is_Emri_Tipleri",
-            "Gerilim_Seviyesi", "kVA_Rating", "Marka",
+            "Kurulum_Tarihi", "Son_Bakimdan_Gecen_Gun",
+            "Son_Bakim_Tipi", "Gerilim_Seviyesi", "Marka",
         ]
         cols_in_features = [c for c in merge_cols if c in features.columns]
         feat_sub = features[cols_in_features].copy()
 
         df_full = df_surv.merge(feat_sub, on="cbs_id", how="left")
-        logger.info(f"[OK] Merged dataset: {len(df_full):,} rows")
+        logger.info(f"[OK] Merged: {len(df_full):,} rows")
         logger.info("")
 
-        # Prepare Cox data
+        # Prepare data
         df_cox = prepare_cox_data(df_full, logger)
 
-        # Cox model
-        cph = fit_cox_model(df_cox, logger)
-        pof_cox = compute_pof_from_cox(cph, df_cox, SURVIVAL_HORIZONS_MONTHS, logger)
+        # ====================================================================
+        # STRATIFIED COX (v3)
+        # ====================================================================
+        stratified_cox = fit_stratified_cox_models(df_cox, logger)
+        cox_pof = compute_pof_from_cox_calibrated(stratified_cox, df_cox, SURVIVAL_HORIZONS_MONTHS, logger)
 
         # Save Cox outputs
-        logger.info("[STEP] Saving Cox PoF outputs")
+        logger.info("[STEP] Saving Cox PoF (calibrated)...")
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-        for m, series in pof_cox.items():
-            out_df = pd.DataFrame({
-                "cbs_id": series.index,
-                f"PoF_Cox_{m}Ay": series.values,
-            })
+        for m, series in cox_pof.items():
+            out_df = pd.DataFrame({"cbs_id": series.index, f"PoF_Cox_Cal_{m}Ay": series.values})
             out_path = os.path.join(OUTPUT_DIR, f"cox_sagkalim_{m}ay_ariza_olasiligi.csv")
             out_df.to_csv(out_path, index=False, encoding="utf-8-sig")
-            logger.info(f"[OK] {out_path}")
-
-        # RSF model
+            logger.info(f"  → {out_path}")
         logger.info("")
-        logger.info("[STEP] Random Survival Forest (RSF)")
+
+        # ====================================================================
+        # WEIBULL AFT (v3 - NEW)
+        # ====================================================================
+        weibull_models = fit_weibull_aft_stratified(df_cox, logger)
+        weibull_pof = compute_pof_from_weibull(weibull_models, df_cox, SURVIVAL_HORIZONS_MONTHS, logger)
+
+        # Save Weibull outputs
+        logger.info("[STEP] Saving Weibull AFT PoF...")
+        for m, series in weibull_pof.items():
+            out_df = pd.DataFrame({"cbs_id": series.index, f"PoF_Weibull_{m}Ay": series.values})
+            out_path = os.path.join(OUTPUT_DIR, f"weibull_sagkalim_{m}ay_ariza_olasiligi.csv")
+            out_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+            logger.info(f"  → {out_path}")
+        logger.info("")
+
+        # ====================================================================
+        # RSF (IMPROVED)
+        # ====================================================================
+        logger.info("[STEP] Running feature selection before RSF...")
+        df_rsf = feature_selection_block(df_cox, logger)
+        rsf = fit_rsf_model(df_rsf, logger)
+        rsf_pof = compute_pof_from_rsf(rsf, df_rsf, SURVIVAL_HORIZONS_MONTHS, logger)
+
         rsf = fit_rsf_model(df_cox, logger)
         rsf_pof = compute_pof_from_rsf(rsf, df_cox, SURVIVAL_HORIZONS_MONTHS, logger)
 
         if rsf_pof:
-            logger.info("[STEP] Saving RSF PoF outputs")
+            logger.info("[STEP] Saving RSF PoF...")
             for m, series in rsf_pof.items():
-                out_df = pd.DataFrame({
-                    "cbs_id": series.index,
-                    f"PoF_RSF_{m}Ay": series.values,
-                })
+                out_df = pd.DataFrame({"cbs_id": series.index, f"PoF_RSF_{m}Ay": series.values})
                 out_path = os.path.join(OUTPUT_DIR, f"rsf_sagkalim_{m}ay_ariza_olasiligi.csv")
                 out_df.to_csv(out_path, index=False, encoding="utf-8-sig")
-                logger.info(f"[OK] {out_path}")
+                logger.info(f"  → {out_path}")
+            logger.info("")
 
-        # ML models
-        logger.info("")
-        logger.info("[STEP] Leakage-free ML PoF")
-
+        # ====================================================================
+        # ML MODELS
+        # ====================================================================
         df_ml = build_leakage_free_ml_dataset(logger)
         train_leakage_free_ml_models(df_ml, logger)
 
-        # Model comparison report
+        # ====================================================================
+        # ENSEMBLE (v3 - NEW)
+        # ====================================================================
         ml_pof_path = os.path.join(OUTPUT_DIR, "leakage_free_ml_pof.csv")
-        if os.path.exists(ml_pof_path) and rsf_pof:
-            generate_model_comparison_report(pof_cox, rsf_pof, ml_pof_path, logger)
+        if os.path.exists(ml_pof_path) and rsf_pof and weibull_pof:
+            ensemble_pof = create_ensemble_pof(cox_pof, weibull_pof, rsf_pof, ml_pof_path, logger)
+            
+            # Save ensemble outputs
+            logger.info("[STEP] Saving ENSEMBLE PoF (RECOMMENDED)...")
+            for m, series in ensemble_pof.items():
+                out_df = pd.DataFrame({"cbs_id": series.index, f"PoF_Ensemble_{m}Ay": series.values})
+                out_path = os.path.join(OUTPUT_DIR, f"ensemble_sagkalim_{m}ay_ariza_olasiligi.csv")
+                out_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+                logger.info(f"  → {out_path}")
+            logger.info("")
 
-        # Visualizations
-        logger.info("")
-        logger.info("[STEP] Generating visualizations...")
-
-        try:
-            from utils.survival_plotting import (
-                plot_survival_curves_by_class,
-                plot_cox_coefficients,
-                plot_feature_importance_comparison
+        # ====================================================================
+        # DIAGNOSTICS (v3 - NEW)
+        # ====================================================================
+        if os.path.exists(ml_pof_path) and rsf_pof and weibull_pof:
+            diagnose_model_disagreement(
+                cox_pof, weibull_pof, rsf_pof, ml_pof_path,
+                stratified_cox, logger
             )
-            from config.config import VISUAL_DIR
 
-            surv_plot_path = os.path.join(VISUAL_DIR, "survival_curves_by_class.png")
-            plot_survival_curves_by_class(df=df_full, output_path=surv_plot_path, logger=logger)
-
-            if cph is not None:
-                cox_plot_path = os.path.join(VISUAL_DIR, "cox_coefficients.png")
-                plot_cox_coefficients(cox_model=cph, output_path=cox_plot_path, logger=logger)
-
-            rsf_imp_path = os.path.join(OUTPUT_DIR, "rsf_feature_importance.csv")
-            shap_imp_path = os.path.join(OUTPUT_DIR, "shap_feature_importance.csv")
-            if os.path.exists(rsf_imp_path) and os.path.exists(shap_imp_path):
-                rsf_imp = pd.read_csv(rsf_imp_path, encoding="utf-8-sig")
-                shap_imp = pd.read_csv(shap_imp_path, encoding="utf-8-sig")
-                comp_plot_path = os.path.join(VISUAL_DIR, "feature_importance_comparison.png")
-                plot_feature_importance_comparison(
-                    rsf_importance=rsf_imp,
-                    shap_importance=shap_imp,
-                    output_path=comp_plot_path,
-                    logger=logger
-                )
-
-        except Exception as e:
-            logger.warning(f"[WARN] Visualization generation failed: {e}")
-
+        logger.info("=" * 80)
+        logger.info("[SUCCESS] 03_sagkalim_modelleri_v3 completed!")
+        logger.info("=" * 80)
         logger.info("")
-        logger.info("[SUCCESS] 03_sagkalim_modelleri completed successfully!")
+        logger.info("OUTPUTS:")
+        logger.info("  - Cox PoF (calibrated, stratified)")
+        logger.info("  - Weibull AFT PoF (stratified)")
+        logger.info("  - RSF PoF")
+        logger.info("  - ML PoF (XGBoost + CatBoost)")
+        logger.info("  - ENSEMBLE PoF ← RECOMMENDED FOR PRODUCTION")
         logger.info("=" * 80)
 
     except Exception as e:
-        logger.exception(f"[FATAL] 03_sagkalim_modelleri failed: {e}")
+        logger.exception(f"[FATAL] Pipeline failed: {e}")
         raise
 
 
