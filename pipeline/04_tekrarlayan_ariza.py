@@ -1,10 +1,11 @@
 """
-04_tekrarlayan_ariza.py (PoF3 - Final Integration v4.3)
+04_tekrarlayan_ariza.py (PoF3 v5.0 - Statistical Chronic Engine)
 
-Updates:
-  - Added 'Dominant Failure Cause' logic using 'Ariza_Nedeni'.
-  - Calculates the most frequent failure reason for each asset.
-  - Integrates this context into the Risk Master for field crews.
+IMPROVEMENTS:
+1. Poisson Risk Model: Calculates Prob(Faults >= 4) for next year based on Lambda.
+   - Transforms static counts into forward-looking risk probabilities.
+2. Dominant Cause Analysis: Identifies the #1 reason for failure per asset.
+3. IEEE 1366 Classification: Standard Critical/High/Medium/Low logic.
 """
 
 import os
@@ -15,6 +16,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
+from scipy.stats import poisson
 
 # Ensure UTF-8 console
 try:
@@ -93,7 +95,6 @@ def load_intermediate_data():
         features = pd.read_csv(feat_path)
     else:
         features = None
-        logger.warning("[WARN] Feature file not found. Validation step will be skipped.")
         
     # Normalize IDs
     events["cbs_id"] = events["cbs_id"].astype(str).str.lower().str.strip()
@@ -104,14 +105,16 @@ def load_intermediate_data():
     return events, equipment, features
 
 # ==============================================================================
-# 2. CHRONIC FAULT LOGIC (IEEE 1366)
+# 2. CHRONIC FAULT LOGIC (IEEE + POISSON)
 # ==============================================================================
 def calculate_chronic_flags(events, data_end_date):
-    logger.info("[STEP] Calculating IEEE Chronic Flags...")
+    logger.info("[STEP] Calculating Chronic Flags & Poisson Probabilities...")
     
+    # Window: Last 365 Days
     window_start = data_end_date - timedelta(days=365)
     recent_events = events[events["Ariza_Baslangic_Zamani"] >= window_start].copy()
     
+    # 1. IEEE 1366 Classification
     counts = recent_events.groupby("cbs_id").size().reset_index(name="Faults_Last_365d")
     
     def categorize(n):
@@ -126,40 +129,41 @@ def calculate_chronic_flags(events, data_end_date):
     
     chronic_df = pd.concat([counts[["cbs_id", "Faults_Last_365d"]], results], axis=1)
     
-    logger.info("[STATS] Chronic Distribution:")
-    for level in ["KRITIK", "YUKSEK", "ORTA", "IZLEME"]:
-        cnt = (chronic_df["Kronik_Seviye_Max"] == level).sum()
-        logger.info(f"  > {level}: {cnt} assets")
+    # 2. Poisson Risk Model (NEW)
+    # Calculate Lambda (Annual Rate)
+    # If no history, assume global average (e.g., 0.5 faults/year)
+    # Here we use the observed count as the Lambda estimator for next year
+    chronic_df['Lambda_Est'] = chronic_df['Faults_Last_365d'].replace(0, 0.2) # Small prior for stability
+    
+    # Probability of exceeding Critical Threshold (4 faults) next year
+    # P(X >= 4) = 1 - P(X <= 3) = 1 - CDF(3)
+    chronic_df['Prob_NextYear_Critical'] = 1 - poisson.cdf(3, chronic_df['Lambda_Est'])
+    
+    # Probability of at least 1 fault next year
+    # P(X >= 1) = 1 - P(X = 0)
+    chronic_df['Prob_NextYear_AnyFault'] = 1 - poisson.pmf(0, chronic_df['Lambda_Est'])
+    
+    logger.info("[STATS] Poisson Risk Analysis:")
+    high_risk_poisson = (chronic_df['Prob_NextYear_Critical'] > 0.5).sum()
+    logger.info(f"  > Assets with >50% chance of becoming Critical next year: {high_risk_poisson}")
         
     return chronic_df
 
 # ==============================================================================
-# 2b. CAUSE CODE ANALYTICS (NEW)
+# 2b. CAUSE CODE ANALYTICS
 # ==============================================================================
 def calculate_dominant_cause(events):
-    """
-    Finds the most frequent 'Ariza_Nedeni' for each asset.
-    Example: TR-101 -> 'Lightning' (3 faults)
-    """
     logger.info("[STEP] Analyzing Dominant Failure Causes...")
-    
     if 'Ariza_Nedeni' not in events.columns:
-        logger.warning("[WARN] 'Ariza_Nedeni' column missing. Skipping cause analysis.")
         return pd.DataFrame(columns=['cbs_id', 'Dominant_Cause'])
 
-    # Filter out empty/unknown causes if desired
     valid_events = events[events['Ariza_Nedeni'].notna() & (events['Ariza_Nedeni'] != 'UNKNOWN')].copy()
-    
-    # Count causes per ID
     cause_counts = valid_events.groupby(['cbs_id', 'Ariza_Nedeni']).size().reset_index(name='count')
     
-    # Sort by count desc and take top 1
-    # This gives the "Mode"
     dominant = cause_counts.sort_values(['cbs_id', 'count'], ascending=[True, False]) \
                            .drop_duplicates(['cbs_id']) \
                            .rename(columns={'Ariza_Nedeni': 'Dominant_Cause'})
     
-    logger.info(f"[STATS] Calculated dominant causes for {len(dominant)} assets.")
     return dominant[['cbs_id', 'Dominant_Cause']]
 
 # ==============================================================================
@@ -187,15 +191,13 @@ def build_statistics_table(equipment, events, data_end_date):
     return stats
 
 # ==============================================================================
-# 4. MERGE STEP 03 RESULTS
+# 4. MERGE & SAVE
 # ==============================================================================
 def integrate_ensemble_results(stats_df):
     logger.info("[STEP] Integrating Ensemble Risk Models...")
-    
     ensemble_path = os.path.join(OUTPUT_DIR, "ensemble_pof_final.csv")
     
     if not os.path.exists(ensemble_path):
-        logger.warning(f"[WARN] Ensemble file not found at {ensemble_path}.")
         return stats_df
     
     ens_df = pd.read_csv(ensemble_path)
@@ -203,46 +205,42 @@ def integrate_ensemble_results(stats_df):
     
     rename_map = {
         "PoF_12Ay": "PoF_Ensemble_12Ay",
-        "PoF_3Ay":  "PoF_Ensemble_3Ay",
-        "PoF_6Ay":  "PoF_Ensemble_6Ay",
-        "PoF_24Ay": "PoF_Ensemble_24Ay"
+        "PoF_36Ay": "PoF_Ensemble_36Ay",
+        "PoF_60Ay": "PoF_Ensemble_60Ay"
     }
     ens_df = ens_df.rename(columns=rename_map)
     
     merged = stats_df.merge(ens_df, on="cbs_id", how="left")
-    logger.info(f"[OK] Integrated risk scores for {len(ens_df)} assets.")
     return merged
 
-# ==============================================================================
-# 5. MAIN EXECUTION
-# ==============================================================================
 def main():
     try:
         data_end_date = load_data_end_date()
         events, equipment, features = load_intermediate_data()
         
-        # 1. Chronic Detection
+        # 1. Chronic Detection (IEEE + Poisson)
         chronic_flags = calculate_chronic_flags(events, data_end_date)
         
-        # 2. Cause Analytics (NEW)
+        # 2. Cause Analytics
         dominant_causes = calculate_dominant_cause(events)
         
         # 3. Stats
         stats_df = build_statistics_table(equipment, events, data_end_date)
         
-        # 4. Merge All (Stats + Chronic + Causes)
+        # 4. Merge All
         master = stats_df.merge(chronic_flags, on="cbs_id", how="left") \
                          .merge(dominant_causes, on="cbs_id", how="left")
         
-        # Clean up NaNs
+        # Cleanup
         master["Kronik_Seviye_Max"] = master["Kronik_Seviye_Max"].fillna("NORMAL")
         master["Faults_Last_365d"] = master["Faults_Last_365d"].fillna(0).astype(int)
         master["Dominant_Cause"] = master["Dominant_Cause"].fillna("No Faults")
+        master["Prob_NextYear_Critical"] = master["Prob_NextYear_Critical"].fillna(0.0)
         
         for col in ["Kronik_Kritik", "Kronik_Yuksek", "Kronik_Orta", "Kronik_Izleme"]:
             master[col] = master[col].fillna(0).astype(int)
             
-        # 5. Integrate Step 03 Models
+        # 5. Integrate Step 03
         final_master = integrate_ensemble_results(master)
         
         # 6. Save
@@ -255,7 +253,7 @@ def main():
         action_df.to_csv(action_path, index=False, encoding="utf-8-sig")
         
         logger.info("="*60)
-        logger.info("[SUCCESS] 04_tekrarlayan_ariza Completed.")
+        logger.info("[SUCCESS] 04_tekrarlayan_ariza Completed (with Statistical Model).")
         logger.info(f"  > Master Risk Table: {risk_path}")
         logger.info("="*60)
         
