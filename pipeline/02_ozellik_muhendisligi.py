@@ -1,11 +1,13 @@
 """
-02_ozellik_muhendisligi.py (PoF3 - Production Complete)
+02_ozellik_muhendisligi.py (PoF3 v6.1 - Extended Production Edition)
 
-Combines:
-1. IEEE 1366 Reporting (Kritik/Yuksek/Orta) -> For Dashboards
-2. AI Predictive Features (Weighted Score, Seasonality, Stress) -> For Model
-3. Robust Sanity Checks & Reporting -> For Data Quality
-4. Geo-Location Pass-Through -> For Field Crews (Il/Ilce/Mahalle)
+COMBINES:
+1. IEEE 1366 Reporting (Kritik/Yuksek/Orta) -> Preserved from v3
+2. AI Predictive Features (Weighted Score, Seasonality) -> Preserved from v3
+3. Robust Sanity Checks & Reporting -> Preserved from v3
+4. Geo-Location Pass-Through -> Preserved from v3
+5. NEW: Loading Proxy Score (Customer Count + Peak Hour Stress) -> Added
+6. NEW: Robust Maintenance Calculation -> Added
 """
 
 import os
@@ -15,6 +17,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import MinMaxScaler  # <--- Added for Loading Proxy
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -25,7 +28,15 @@ try:
 except Exception:
     pass
 
-from utils.date_parser import parse_date_safely
+# Assuming utils exists as per your previous file
+# If utils/date_parser.py is missing, this line can be replaced with a simple function
+try:
+    from utils.date_parser import parse_date_safely
+except ImportError:
+    # Fallback if util is missing
+    def parse_date_safely(date_str):
+        return pd.to_datetime(date_str, errors='coerce')
+
 from config.config import (
     ANALYSIS_DATE,
     INTERMEDIATE_PATHS,
@@ -56,7 +67,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(ch)
 
     logger.info("=" * 80)
-    logger.info(f"{STEP_NAME} - PoF3 Feature Engineering (Production Complete)")
+    logger.info(f"{STEP_NAME} - PoF3 Feature Engineering (Extended Production v6.1)")
     logger.info("=" * 80)
     return logger
 
@@ -152,40 +163,30 @@ def calculate_weighted_chronic_score(df_equip, df_faults, data_end_date, logger)
     return df_merged
 
 # ---------------------------------------------------------
-# 3. SEASONALITY & STRESS (AI Layer)
+# 3. SEASONALITY, STRESS & LOADING PROXY (AI Layer)
 # ---------------------------------------------------------
-# ---------------------------------------------------------
-# 3. SEASONALITY & STRESS (AI Layer) - FIXED
-# ---------------------------------------------------------
-def add_ai_features(df, data_end_date, logger):
+def add_ai_features(df, events, data_end_date, logger): # <--- UPDATED to accept 'events'
     """
-    Adds Seasonality (Sin/Cos) and Stress Proxies (Urban/Customer).
-    FIX: Uses log1p to prevent -inf errors for 0 customer counts.
+    Adds Seasonality (Sin/Cos), Stress Proxies, and NEW Loading Proxy.
     """
-    logger.info("[AI-FEATURES] Generating Seasonality & Stress Proxies...")
+    logger.info("[AI-FEATURES] Generating Seasonality, Stress & Loading Proxy...")
     
     # A. Seasonality
     current_month = data_end_date.month
     df['Season_Sin'] = np.sin(2 * np.pi * current_month / 12)
     df['Season_Cos'] = np.cos(2 * np.pi * current_month / 12)
     
-    # B. Stress Proxies
-    # 1. Customer Count (Log transform for skew)
+    # B. Customer Count (Log transform for skew)
     if 'Musteri_Sayisi' in df.columns:
-        # Fill NaNs with 0 before log
-        df['Musteri_Sayisi'] = df['Musteri_Sayisi'].fillna(0)
-        
-        # SAFETY FIX: use log1p (log(1+x)) to handle 0 values
-        # Old code: np.log(df['Musteri_Sayisi']) -> -inf if 0
+        df['Musteri_Sayisi'] = df['Musteri_Sayisi'].fillna(0).clip(lower=0)
+        # SAFETY FIX: use log1p
         df['Log_Musteri_Sayisi'] = np.log1p(df['Musteri_Sayisi']) 
-        df['Musteri_Sayisi'] = df['Musteri_Sayisi'].clip(lower=0) # Fix negative values
-        df['Log_Musteri_Sayisi'] = np.log1p(df['Musteri_Sayisi'])
-        # Double safety: Clip negative infinity just in case of negative input
         df['Log_Musteri_Sayisi'] = df['Log_Musteri_Sayisi'].replace([np.inf, -np.inf], 0)
     else:
         df['Log_Musteri_Sayisi'] = 0
+        df['Musteri_Sayisi'] = 0
         
-    # 2. Environmental Stress (Urban/Rural)
+    # C. Environmental Stress (Urban/Rural)
     stress_cols = ['urban mv', 'urban lv', 'rural mv', 'rural lv', 'suburban mv', 'suburban lv']
     df['Environment_Stress_Index'] = 0.0
     
@@ -199,18 +200,38 @@ def add_ai_features(df, data_end_date, logger):
             
     if not found_any:
         df['Environment_Stress_Index'] = 0
+
+    # D. NEW: LOADING PROXY SCORE (The "Stolen Feature")
+    # 1. Calculate Peak Hour Failure Ratio
+    if not events.empty:
+        events['Hour'] = events['Ariza_Baslangic_Zamani'].dt.hour
+        # Peak hours defined as 17:00 - 21:00
+        events['Is_Peak'] = events['Hour'].apply(lambda x: 1 if 17 <= x <= 21 else 0)
+        peak_ratio = events.groupby('cbs_id')['Is_Peak'].mean()
+        df['Peak_Hour_Arıza_Oranı'] = df['cbs_id'].map(peak_ratio).fillna(0)
+    else:
+        df['Peak_Hour_Arıza_Oranı'] = 0
+
+    # 2. Composite Score (60% Customer Load + 40% Peak Hour Vulnerability)
+    scaler = MinMaxScaler()
+    # Reshape for scaler
+    cust_norm = scaler.fit_transform(df[['Log_Musteri_Sayisi']].fillna(0))
+    
+    df['Yüklenme_Proxy_Skor'] = ((cust_norm.flatten() * 0.6) + (df['Peak_Hour_Arıza_Oranı'] * 0.4)) * 100
+    logger.info(f"  > Loading Proxy Calculated. Mean Score: {df['Yüklenme_Proxy_Skor'].mean():.2f}")
         
     return df
 
 # ---------------------------------------------------------
-# 4. REPORTING & SANITY (Restored)
+# 4. REPORTING & SANITY
 # ---------------------------------------------------------
 def generate_feature_distribution_report(features, logger, output_dir):
     """
     Logs basic stats for key features.
     """
     logger.info("[DISTRIBUTION] Generating simple report...")
-    numeric_cols = ["Ekipman_Yasi_Gun", "Ariza_Sayisi", "Weighted_Chronic_Index", "Environment_Stress_Index"]
+    numeric_cols = ["Ekipman_Yasi_Gun", "Ariza_Sayisi", "Weighted_Chronic_Index", 
+                    "Environment_Stress_Index", "Yüklenme_Proxy_Skor"] # Added new score
     
     summary = []
     for col in numeric_cols:
@@ -293,12 +314,12 @@ def main():
         # Explicitly keep Geo-columns for Reporting
         base_cols = [
             "cbs_id", "Ekipman_Tipi", "Kurulum_Tarihi", "Ekipman_Yasi_Gun", 
-            "Ariza_Gecmisi", "Fault_Count"
+            "Ariza_Gecmisi", "Fault_Count", "Son_Bakim_Tarihi" # Added Son_Bakim_Tarihi
         ]
         
         # ADD GEO COLUMNS HERE TO ENSURE PASS-THROUGH
         geo_cols = ["Latitude", "Longitude", "Sehir", "Ilce", "Mahalle", "Musteri_Sayisi"]
-        cols_to_keep = base_cols + [c for c in geo_cols if c in equipment.columns]
+        cols_to_keep = [c for c in base_cols + geo_cols if c in equipment.columns]
         
         features = equipment[cols_to_keep].copy()
         
@@ -316,25 +337,33 @@ def main():
         if not events.empty:
             features = calculate_weighted_chronic_score(features, events, data_end_date, logger)
             
-        # 4. AI Seasonality & Stress
-        features = add_ai_features(features, data_end_date, logger)
+        # 4. AI Seasonality & Stress & LOADING PROXY (UPDATED)
+        features = add_ai_features(features, events, data_end_date, logger)
         
-        # 5. Reliability Metrics (MTBF/TFF) (Inline Logic)
-        if not events.empty:
-            # Inline TFF/MTBF to save space but keep logic
-            # (In production, keeping this modular is better, but this works for single script)
-            # Re-using the logic from previous valid script...
-            pass # (Assuming reliability logic is embedded or separate function)
+        # 5. ROBUST MAINTENANCE CALCULATION (NEW)
+        # This fixes the missing 'Son_Bakim_Gun_Sayisi' error in Step 04
+        logger.info("[FEAT] Calculating Maintenance Recency (Robust)...")
+        if 'Son_Bakim_Tarihi' in features.columns:
+            features['Son_Bakim_Tarihi'] = pd.to_datetime(features['Son_Bakim_Tarihi'], errors='coerce')
+            features['Son_Bakim_Gun_Sayisi'] = (data_end_date - features['Son_Bakim_Tarihi']).dt.days
+            # Fill NaTs with 9999 (Never maintained)
+            features['Son_Bakim_Gun_Sayisi'] = features['Son_Bakim_Gun_Sayisi'].fillna(9999)
+        else:
+            features['Son_Bakim_Gun_Sayisi'] = 9999
+            
+        if 'Bakim_Sayisi' not in features.columns:
+            features['Bakim_Sayisi'] = 0
 
         # 6. Numeric Parsing
         features = parse_numerics(features, logger)
         
-        # 7. Final Sanity Fixes
+        # 7. Final Sanity Fixes (Recency)
         if not events.empty:
             last_dates = events.groupby("cbs_id")["Ariza_Baslangic_Zamani"].max()
             features = features.merge(last_dates.rename("Son_Ariza_Tarihi"), on="cbs_id", how="left")
             features["Son_Ariza_Gun_Sayisi"] = (data_end_date - features["Son_Ariza_Tarihi"]).dt.days
             features.loc[features["Son_Ariza_Gun_Sayisi"].between(-5, 0), "Son_Ariza_Gun_Sayisi"] = 0
+            features["Son_Ariza_Gun_Sayisi"] = features["Son_Ariza_Gun_Sayisi"].fillna(3650) # Fill NaNs
             
         # 8. Reports
         output_dir = os.path.dirname(FEATURE_OUTPUT_PATH)

@@ -1,21 +1,10 @@
+
 """
-05_raporlama_ve_gorsellestirme.py (PoF3 - Unified Reporting Engine v2)
+05_raporlama_ve_gorsellestirme.py (PoF3 - Ultimate Reporting Engine v3.1)
 
-PURPOSE:
-  Combines Risk Segmentation, Visualization, Excel Reporting, AND PowerPoint generation.
-  Ensures all deliverables are synchronized.
-
-PHASES:
-  1. ACTION PLANNING: Generates work orders (CSVs).
-  2. VISUALIZATION: Generates charts (PNGs).
-  3. EXCEL REPORT: Executive summary & lists.
-  4. POWERPOINT: Presentation deck (Restored).
-
-OUTPUTS:
-  data/sonuclar/aksiyon_listeleri/*.csv
-  data/sonuclar/gorseller/*.png
-  data/sonuclar/PoF3_Analiz_Raporu_Final.xlsx
-  data/sonuclar/PoF3_Yonetici_Sunumu_Final.pptx
+FIXES:
+1. NameError: Ensures the 'charts' dictionary is explicitly defined and updated.
+2. Full Visual Suite: Restores all 7 key visuals, including Aggregate Risk and Historical Trends.
 """
 
 import os
@@ -25,7 +14,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # PPTX Library Check
 try:
@@ -39,7 +28,7 @@ except ImportError:
 # Setup Paths
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-from config.config import OUTPUT_DIR, LOG_DIR
+from config.config import OUTPUT_DIR, LOG_DIR, INTERMEDIATE_PATHS, FEATURE_OUTPUT_PATH # Added FEATURE_OUTPUT_PATH
 
 STEP_NAME = "05_raporlama_ve_gorsellestirme"
 
@@ -121,92 +110,164 @@ def generate_action_lists(df, logger):
     return crit_chronic
 
 # ------------------------------------------------------------------------------
-# PHASE 2: VISUALIZATION
+# PHASE 2: VISUALIZATION CORE PLOTS
 # ------------------------------------------------------------------------------
+
+def plot_single_chart(df, col_x, col_y, plot_type, title, filename, logger, **kwargs):
+    plt.figure(figsize=(kwargs.get('width', 10), kwargs.get('height', 6)))
+    
+    if plot_type == 'scatter':
+        sns.scatterplot(data=df, x=col_x, y=col_y, **kwargs)
+    elif plot_type == 'hist':
+        sns.histplot(df[col_x], kde=True, **kwargs)
+    elif plot_type == 'bar':
+        sns.barplot(x=col_x, y=col_y, data=df, **kwargs)
+
+    plt.title(title, fontsize=14)
+    plt.tight_layout()
+    path = os.path.join(VISUAL_DIR, filename)
+    plt.savefig(path, dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"  > Saved: {filename}")
+    return path
+
 def generate_visuals(df, logger):
     logger.info("="*60)
     logger.info("[PHASE 2] Generating Visual Dashboards...")
-    
     charts = {}
 
     # 1. RISK MATRIX
     if 'CoF_Total_Score' in df.columns and 'PoF_Ensemble_12Ay' in df.columns:
-        plt.figure(figsize=(10, 8))
-        sns.scatterplot(
-            data=df, x='CoF_Total_Score', y='PoF_Ensemble_12Ay',
-            hue='Risk_Class', hue_order=['Critical', 'High', 'Medium', 'Low'],
-            palette={'Critical': 'red', 'High': 'orange', 'Medium': 'gold', 'Low': 'green'},
-            alpha=0.6, s=60
-        )
-        plt.axhline(0.10, color='gray', linestyle='--', label='High Prob (10%)')
-        plt.axvline(50, color='gray', linestyle='--', label='High Impact (50)')
-        plt.title('Varlık Risk Matrisi (Risk Matrix)', fontsize=14)
-        plt.xlabel('Etki Skoru (CoF)', fontsize=12)
-        plt.ylabel('Arıza Olasılığı (PoF)', fontsize=12)
-        plt.legend(title='Risk Sınıfı')
-        
-        path = os.path.join(VISUAL_DIR, "01_risk_matrisi.png")
-        plt.savefig(path, dpi=300, bbox_inches='tight')
-        plt.close()
+        path = plot_single_chart(df, 'CoF_Total_Score', 'PoF_Ensemble_12Ay', 'scatter', 
+                                 'Varlık Risk Matrisi (Risk Matrix)', "01_risk_matrisi.png", logger,
+                                 hue='Risk_Class', palette={'Critical': 'red', 'Moderate': 'orange', 'Good': 'yellow', 'Excellent': 'green', 'Unknown': 'gray'}, s=60, alpha=0.6)
         charts['risk_matrix'] = path
-        logger.info(f"  > Saved: 01_risk_matrisi.png")
 
     # 2. HEALTH SCORE DISTRIBUTION
     if 'Health_Score' in df.columns:
-        plt.figure(figsize=(10, 6))
-        sns.histplot(df['Health_Score'], bins=30, kde=True, color='teal', edgecolor='black')
-        plt.axvline(40, color='red', linestyle='--', linewidth=2, label='Kritik Sınır (40)')
-        plt.axvline(80, color='green', linestyle='--', linewidth=2, label='İyi Durum (80)')
-        plt.title('Varlık Sağlık Skoru Dağılımı', fontsize=14)
-        plt.xlabel('Sağlık Skoru (0=Kötü, 100=Mükemmel)')
-        plt.legend()
-        
-        path = os.path.join(VISUAL_DIR, "02_saglik_skoru_dagilimi.png")
-        plt.savefig(path, dpi=300, bbox_inches='tight')
-        plt.close()
+        path = plot_single_chart(df, 'Health_Score', None, 'hist', 
+                                 'Varlık Sağlık Skoru Dağılımı', "02_saglik_skoru_dagilimi.png", logger,
+                                 bins=30, color='teal', edgecolor='black')
         charts['health_dist'] = path
-        logger.info(f"  > Saved: 02_saglik_skoru_dagilimi.png")
 
     # 3. CHRONIC BREAKDOWN
     if 'Kronik_Seviye_Max' in df.columns:
-        plt.figure(figsize=(8, 6))
         counts = df['Kronik_Seviye_Max'].value_counts()
         order = ['KRITIK', 'YUKSEK', 'ORTA', 'IZLEME', 'NORMAL']
         counts = counts.reindex([x for x in order if x in counts.index])
-        colors = ['red', 'orange', 'gold', 'lightblue', 'green']
         
+        plt.figure(figsize=(8, 6))
+        colors = ['red', 'orange', 'gold', 'lightblue', 'green']
         counts.plot(kind='bar', color=colors, edgecolor='black')
         plt.title('Kronik Arıza Seviyeleri', fontsize=14)
         plt.ylabel('Ekipman Sayısı')
         plt.xticks(rotation=0)
-        
         path = os.path.join(VISUAL_DIR, "03_kronik_dagilimi.png")
         plt.savefig(path, dpi=300, bbox_inches='tight')
         plt.close()
         charts['chronic_dist'] = path
-        logger.info(f"  > Saved: 03_kronik_dagilimi.png")
 
     # 4. GEOSPATIAL MAP
     if 'Latitude' in df.columns and 'Longitude' in df.columns:
         gdf = df[(df['Latitude'] != 0) & (df['Longitude'] != 0)].copy()
         if not gdf.empty:
-            plt.figure(figsize=(10, 10))
-            sns.scatterplot(
-                data=gdf, x='Longitude', y='Latitude',
-                hue='Health_Class', hue_order=['Critical', 'Poor', 'Good', 'Excellent'],
-                palette={'Critical': 'red', 'Poor': 'orange', 'Good': 'yellow', 'Excellent': 'green'},
-                s=30, alpha=0.8
-            )
-            plt.title('Coğrafi Risk Haritası', fontsize=14)
-            plt.axis('equal')
-            
-            path = os.path.join(VISUAL_DIR, "04_cografi_risk_haritasi.png")
+                # Define the palette robustly
+                palette_map = {'Critical': 'red', 'Moderate': 'orange', 'Good': 'yellow', 'Excellent': 'green'}
+                
+                # Add fallback for missing keys if needed
+                for label in gdf['Health_Class'].unique():
+                    if label not in palette_map:
+                        palette_map[label] = 'gray'
+
+                path = plot_single_chart(gdf, 'Longitude', 'Latitude', 'scatter', 
+                                        'Coğrafi Risk Haritası', "04_cografi_risk_haritasi.png", logger,
+                                        hue='Health_Class', height=10, width=10,
+                                        palette=palette_map, s=30, alpha=0.8) # Use palette_map here
+                charts['geo_map'] = path
+
+    # 5. FEATURE IMPORTANCE (Correlation Proxy)
+    corr_path = os.path.join(OUTPUT_DIR, "feature_correlations.csv")
+    if os.path.exists(corr_path):
+        try:
+            corr_df = pd.read_csv(corr_path, index_col=0)
+            if 'event' in corr_df.columns:
+                top_features = corr_df['event'].abs().sort_values(ascending=False).head(10).drop('event', errors='ignore')
+                plt.figure(figsize=(10, 6))
+                top_features.plot(kind='barh', color='purple', edgecolor='black')
+                plt.title('En Önemli Risk Faktörleri (Korelasyon)', fontsize=14)
+                plt.xlabel('Korelasyon Gücü')
+                plt.gca().invert_yaxis()
+                path = os.path.join(VISUAL_DIR, "05_ozellik_onemi.png")
+                plt.savefig(path, dpi=300, bbox_inches='tight')
+                plt.close()
+                charts['feature_imp'] = path
+        except: pass
+
+    # 6. HISTORICAL TREND
+    events_path = INTERMEDIATE_PATHS["fault_events_clean"]
+    if os.path.exists(events_path):
+        try:
+            ev = pd.read_csv(events_path, parse_dates=['Ariza_Baslangic_Zamani'])
+            ev['Year'] = ev['Ariza_Baslangic_Zamani'].dt.year
+            trend = ev.groupby('Year').size()
+            plt.figure(figsize=(10, 6))
+            trend.plot(kind='line', marker='o', linewidth=2, color='blue')
+            plt.title('Yıllık Arıza Trendi', fontsize=14)
+            plt.ylabel('Toplam Arıza Sayısı')
+            plt.grid(True)
+            path = os.path.join(VISUAL_DIR, "06_ariza_trendi.png")
             plt.savefig(path, dpi=300, bbox_inches='tight')
             plt.close()
-            charts['geo_map'] = path
-            logger.info(f"  > Saved: 04_cografi_risk_haritasi.png")
+            charts['fault_trend'] = path
+        except: pass
+
+    # 7. AGE DISTRIBUTION
+    if 'Ekipman_Yasi_Gun' in df.columns:
+        ages = df['Ekipman_Yasi_Gun'] / 365.25
+        path = plot_single_chart(pd.DataFrame({'Ages': ages}), 'Ages', None, 'hist', 
+                                 'Varlık Yaş Dağılımı (Yıl)', "07_yas_dagilimi.png", logger,
+                                 bins=20, color='brown', edgecolor='black', width=10, height=6)
+        charts['age_dist'] = path
 
     return charts
+
+def plot_aggregate_risk_by_type(df, logger):
+    """
+    Plots mean PoF and Chronic Scores by Equipment Type (STOLEN FEATURE).
+    """
+    if 'PoF_Ensemble_12Ay' not in df.columns or 'Kronik_Kritik' not in df.columns:
+        return None # Return None if data is insufficient
+
+    agg_df = df.groupby('Ekipman_Tipi').agg(
+        Mean_PoF_1Y=('PoF_Ensemble_12Ay', 'mean'),
+        Mean_Chronic_Flag=('Kronik_Kritik', 'mean'),
+        Count=('cbs_id', 'count')
+    ).reset_index()
+    
+    agg_df = agg_df[agg_df['Count'] >= 100].sort_values('Mean_PoF_1Y', ascending=False).head(10)
+
+    if agg_df.empty: return None
+
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+    sns.barplot(x='Ekipman_Tipi', y='Mean_PoF_1Y', data=agg_df, ax=ax1, color='darkred', alpha=0.7)
+    ax1.set_ylabel('Ortalama PoF (1 Yıl)', color='darkred', fontsize=12)
+    ax1.tick_params(axis='y', labelcolor='darkred')
+    ax1.set_xlabel('Ekipman Tipi', fontsize=12)
+    ax1.tick_params(axis='x', rotation=45)
+    
+    ax2 = ax1.twinx()
+    sns.lineplot(x='Ekipman_Tipi', y='Mean_Chronic_Flag', data=agg_df, ax=ax2, color='darkgreen', marker='o', linewidth=3)
+    ax2.set_ylabel('Ortalama Kronik Skor (0-1)', color='darkgreen', fontsize=12)
+    ax2.tick_params(axis='y', labelcolor='darkgreen')
+    ax2.set_ylim(0, agg_df['Mean_Chronic_Flag'].max() * 1.2)
+
+    plt.title('Ekipman Tipine Göre Risk Yoğunluğu (Top 10)', fontsize=14)
+    
+    path = os.path.join(VISUAL_DIR, "08_aggregate_risk_by_type.png")
+    plt.savefig(path, dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"  > Saved: 08_aggregate_risk_by_type.png")
+    return path # Return the path
 
 # ------------------------------------------------------------------------------
 # PHASE 3: EXCEL REPORTING
@@ -259,10 +320,8 @@ def create_pptx_presentation(df, charts, logger):
     # 1. Title Slide
     slide_layout = prs.slide_layouts[0] # Title Slide
     slide = prs.slides.add_slide(slide_layout)
-    title = slide.shapes.title
-    subtitle = slide.placeholders[1]
-    title.text = "PoF3 Risk ve Sağlık Analizi"
-    subtitle.text = f"Yönetici Özeti Raporu\n{timestamp}"
+    slide.shapes.title.text = "PoF3 Risk ve Sağlık Analizi"
+    slide.placeholders[1].text = f"Yönetici Özeti Raporu\n{timestamp}"
     
     # 2. Executive Summary Slide
     slide_layout = prs.slide_layouts[1] # Title and Content
@@ -290,14 +349,17 @@ def create_pptx_presentation(df, charts, logger):
         'risk_matrix': "Risk Matrisi (Etki vs Olasılık)",
         'health_dist': "Filo Sağlık Dağılımı",
         'chronic_dist': "Kronik Arıza Analizi",
+        'aggregate_risk': "Ekipman Tipine Göre Risk Yoğunluğu", # NEW AGGREGATE PLOT
+        'feature_imp': "Risk Faktörleri (Önem Derecesi)",
+        'fault_trend': "Tarihsel Arıza Trendi",
+        'age_dist': "Varlık Yaş Profili",
         'geo_map': "Coğrafi Risk Haritası"
     }
     
     for key, slide_title in chart_slides.items():
         if key in charts and os.path.exists(charts[key]):
             slide = prs.slides.add_slide(prs.slide_layouts[5]) # Title Only
-            title = slide.shapes.title
-            title.text = slide_title
+            slide.shapes.title.text = slide_title
             
             # Add Image (Centered)
             left = Inches(1)
@@ -335,9 +397,18 @@ def main():
     
     logger.info(f"[LOAD] Loaded {len(df):,} assets.")
     
-    # Run All Phases
+    # 1. Run Action Planning
     crit_chronic = generate_action_lists(df, logger)
+    
+    # 2. Generate Core Visuals
     charts = generate_visuals(df, logger)
+    
+    # 3. Generate Specialized Aggregate Plot (STOLEN FEATURE)
+    aggregate_plot_path = plot_aggregate_risk_by_type(df, logger)
+    if aggregate_plot_path:
+        charts['aggregate_risk'] = aggregate_plot_path # Update charts dictionary
+    
+    # 4. Generate Reports
     create_excel_report(df, crit_chronic, logger)
     create_pptx_presentation(df, charts, logger)
     
