@@ -15,7 +15,7 @@ except Exception:
 PROJE_KOKU = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ------------------------------------------------------------------------------
-# PIPELINE DEFINITION (Updated Structure)
+# PIPELINE DEFINITION (Corrected Filenames)
 # Format: (Step Name, Script Path, Is Critical?)
 # ------------------------------------------------------------------------------
 ADIMLAR = [
@@ -26,16 +26,16 @@ ADIMLAR = [
     ("02_ozellik_muhendisligi", os.path.join("pipeline", "02_ozellik_muhendisligi.py"), True),
     
     # 3. AI Models (Cox + Weibull + RSF + ML + Ensemble)
-    # Note: Ensure your script is named '03_hibrit_model.py' or update here
-    ("03_hibrit_model",         os.path.join("pipeline", "03_hibrit_model.py"), True),
+    # CORRECTED: Points to your actual filename '03_sagkalim_modelleri.py'
+    ("03_sagkalim_modelleri",   os.path.join("pipeline", "03_sagkalim_modelleri.py"), True),
     
     # 4. Chronic Analysis (IEEE 1366)
     ("04_tekrarlayan_ariza",    os.path.join("pipeline", "04_tekrarlayan_ariza.py"), True),
     
-    # 4b. Risk Scoring (CoF * PoF) - NEW STEP
-    ("04_risk_scoring",         os.path.join("pipeline", "04_risk_scoring.py"), True),
+    # 4b. Risk Scoring (CoF * PoF)
+    ("04b_risk_scoring",         os.path.join("pipeline", "04b_risk_scoring.py"), True),
     
-    # 5. Reporting & Visualization (Merged 05+06+07) - NEW STEP
+    # 5. Reporting & Visualization (Merged 05+06+07)
     ("05_raporlama",            os.path.join("pipeline", "05_raporlama_ve_gorsellestirme.py"), False),
 ]
 
@@ -101,7 +101,7 @@ def main():
     logger, log_path = setup_master_logger()
 
     logger.info("=" * 80)
-    logger.info("PoF3 PIPELINE ORCHESTRATOR (v4.0 Final)")
+    logger.info("PoF3 PIPELINE ORCHESTRATOR (v4.1 Final)")
     logger.info(f"Zaman: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 80)
 
