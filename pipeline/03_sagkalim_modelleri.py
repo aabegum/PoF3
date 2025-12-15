@@ -129,7 +129,7 @@ class MultiHorizonML:
             )
             
             # 1. XGBoost
-            clf_xgb = xgb.XGBClassifier(n_estimators=100, max_depth=4, eval_metric='logloss', use_label_encoder=False)
+            clf_xgb = xgb.XGBClassifier(n_estimators=100, max_depth=4, eval_metric='logloss')
             clf_xgb.fit(X_train, y_train)
             auc_xgb = roc_auc_score(y_test, clf_xgb.predict_proba(X_test)[:, 1])
             self.models_xgb[h] = clf_xgb

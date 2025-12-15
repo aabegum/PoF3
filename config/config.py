@@ -33,7 +33,13 @@ LOG_DIR = os.path.join(BASE_DIR, "loglar")
 for d in [INPUT_DIR, INTERMEDIATE_DIR, OUTPUT_DIR, VISUAL_DIR, LOG_DIR]:
     os.makedirs(d, exist_ok=True)
 
+# OPEN: config/config.py
 
+# ADD this line inside the file (near other directory definitions):
+MODEL_DIR = os.path.join(DATA_DIR, "modeller") 
+
+# If you use Path objects instead of os.path, use this:
+# MODEL_DIR = PROJECT_ROOT / "modeller"
 # ======================================================
 # Analiz Parametreleri
 # ======================================================

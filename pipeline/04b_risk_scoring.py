@@ -1,12 +1,13 @@
 """
-04_risk_scoring.py (PoF3 - Advanced Risk Engine - Robust v4.2)
+04b_risk_scoring.py (PoF3 - Advanced Risk Engine - Robust v4.3)
 
 Purpose:
   Calculates the Consequence of Failure (CoF) and Total Risk Score.
   
 Fixes:
+  - RECOVERS 'Gerilim_Seviyesi' from Master file if missing (The Critical Fix).
   - Robust check for 'Gerilim_Seviyesi_kV'.
-  - Defaults to Low Voltage logic if voltage data is missing (prevents crash).
+  - Defaults to Low Voltage logic if voltage data is truly missing.
 """
 
 import os
@@ -19,9 +20,9 @@ from sklearn.preprocessing import MinMaxScaler
 # Setup Paths
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-from config.config import DATA_DIR, OUTPUT_DIR, LOG_DIR
+from config.config import DATA_DIR, OUTPUT_DIR, LOG_DIR, INTERMEDIATE_PATHS
 
-STEP_NAME = "04_risk_scoring"
+STEP_NAME = "04b_risk_scoring"
 
 # ------------------------------------------------------------------------------
 # CONFIGURATION
@@ -70,51 +71,55 @@ def calculate_cof(df, mttr_map, global_mttr, logger):
     logger.info("[CoF] Calculating Consequence Scores...")
     
     # --- A. FINANCIAL CoF ---
+    # Map cost based on equipment type, default to 5000 if unknown
     df['Cost_Base'] = df['Ekipman_Tipi'].map(COST_MAP).fillna(5000)
     
-    # --- SAFETY FIX: Handle Missing Voltage ---
+    # --- VOLTAGE MULTIPLIER LOGIC ---
     df['Voltage_Mult'] = 1.0 # Default to Low Voltage
     
-    # Try to find or parse voltage
+    # Check if we have the specific kV column, if not try to parse 'Gerilim_Seviyesi'
     if 'Gerilim_Seviyesi_kV' not in df.columns:
         if 'Gerilim_Seviyesi' in df.columns:
-             # Parse raw string
+             # Extract number from string (e.g., "34.5 kV" -> 34.5)
              df['Gerilim_Seviyesi_kV'] = df['Gerilim_Seviyesi'].astype(str).str.extract(r'(\d+\.?\d*)').astype(float)
         else:
-             # Create dummy column to prevent crash (Value 0 = Low Voltage)
+             # Truly missing: Create dummy column with 0 (Low Voltage)
              df['Gerilim_Seviyesi_kV'] = 0.0
-             logger.warning("  [WARN] 'Gerilim_Seviyesi' missing. Defaulting to Low Voltage logic.")
+             logger.warning("  [WARN] 'Gerilim_Seviyesi' completely missing in dataframe. Using default 1.0x multiplier.")
 
-    # Apply Logic safely
-    # Medium Voltage (>1kV)
+    # Apply Logic based on kV
+    # Medium Voltage (>1kV) -> 1.5x
     df.loc[df['Gerilim_Seviyesi_kV'] > 1, 'Voltage_Mult'] = 1.5
-    # High Voltage (>30kV)
+    # High Voltage (>30kV) -> 2.0x
     df.loc[df['Gerilim_Seviyesi_kV'] > 30, 'Voltage_Mult'] = 2.0
     
+    # Calculate Financial Score
     df['CoF_Financial'] = df['Cost_Base'] * df['Voltage_Mult']
     
     # --- B. OPERATIONAL CoF ---
+    # Handle customer count
     if 'Musteri_Sayisi' in df.columns:
         df['Musteri_Sayisi'] = df['Musteri_Sayisi'].fillna(0).clip(lower=1)
     else:
         df['Musteri_Sayisi'] = 1 # Fallback
         
+    # Map Expected Repair Time
     df['Exp_Duration_Min'] = df['Ekipman_Tipi'].map(mttr_map).fillna(global_mttr)
     
+    # Environmental Factor
     df['Env_Factor'] = 1.0
     if 'urban mv' in df.columns:
         df.loc[df['urban mv'] > 0, 'Env_Factor'] = 1.5
         
+    # Raw Operational Score
     df['CoF_Operational_Raw'] = df['Musteri_Sayisi'] * df['Exp_Duration_Min'] * df['Env_Factor']
     
-    # Normalize (Log scale for operational due to skewed customer counts)
+    # Normalize Scores (Log scale for operational due to high variance)
     scaler = MinMaxScaler(feature_range=(1, 100))
     
-    # Check if we have data to scale
     if not df.empty:
         log_op = np.log1p(df[['CoF_Operational_Raw']])
         df['CoF_Operational_Score'] = scaler.fit_transform(log_op)
-        
         df['CoF_Financial_Score'] = scaler.fit_transform(df[['CoF_Financial']])
     else:
         df['CoF_Operational_Score'] = 0
@@ -132,6 +137,7 @@ def calculate_cof(df, mttr_map, global_mttr, logger):
 def calculate_risk(df, logger):
     logger.info("[RISK] Calculating Final Risk Scores...")
     
+    # Find the correct PoF column (Prefer 12 Month Ensemble)
     target_pof = 'PoF_Ensemble_12Ay'
     if target_pof not in df.columns:
         pofs = [c for c in df.columns if 'PoF' in c and '12Ay' in c]
@@ -141,7 +147,7 @@ def calculate_risk(df, logger):
         logger.info(f"  > Using {target_pof} for Risk Calculation")
         df['Risk_Score'] = df[target_pof] * df['CoF_Total_Score']
         
-        # Dynamic Percentile Bucketing
+        # Dynamic Percentile Bucketing (Ensures we always have 'Critical' assets)
         try:
             p90 = df['Risk_Score'].quantile(0.90)
             p70 = df['Risk_Score'].quantile(0.70)
@@ -183,8 +189,32 @@ def main():
     df_risk = pd.read_csv(risk_master_path)
     df_events = pd.read_csv(events_path)
     
-    # Normalize
+    # Normalize ID
     df_risk['cbs_id'] = df_risk['cbs_id'].astype(str).str.lower().str.strip()
+
+    # ==========================================================================
+    # 🔴 CRITICAL FIX: RECOVER MISSING DATA FROM MASTER
+    # ==========================================================================
+    # If 'Gerilim_Seviyesi' or 'Musteri_Sayisi' is missing from previous steps,
+    # we go back to the source (equipment_master) and fetch it.
+    if 'Gerilim_Seviyesi' not in df_risk.columns or 'Musteri_Sayisi' not in df_risk.columns:
+        master_path = INTERMEDIATE_PATHS["equipment_master"]
+        if os.path.exists(master_path):
+            logger.info("[FIX] Recovering missing columns (Voltage/Customer) from Master File...")
+            
+            # Select columns to recover
+            cols_to_load = ['cbs_id']
+            if 'Gerilim_Seviyesi' not in df_risk.columns: cols_to_load.append('Gerilim_Seviyesi')
+            if 'Musteri_Sayisi' not in df_risk.columns: cols_to_load.append('Musteri_Sayisi')
+            
+            # Load Master
+            meta = pd.read_csv(master_path, usecols=cols_to_load)
+            meta['cbs_id'] = meta['cbs_id'].astype(str).str.lower().str.strip()
+            
+            # Merge
+            df_risk = df_risk.merge(meta, on='cbs_id', how='left')
+            logger.info(f"  > Recovered columns: {cols_to_load[1:]}")
+    # ==========================================================================
     
     # 2. Calc MTTR
     mttr_map, global_mttr = calculate_mttr_proxy(df_events, logger)

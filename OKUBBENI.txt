@@ -1,0 +1,293 @@
+================================================================================
+PoF3 ARIZA OLASILIGI ANALİZİ - SONUÇLAR DOKÜMANTASYONU
+================================================================================
+
+Proje: Elektrik Dağıtım Ekipmanları Arıza Olasılığı (PoF) Analizi
+Tarih: 2025-12-10
+Versiyon: 3.0 (Çok Seviyeli Kronik Tespit Sistemi)
+
+================================================================================
+1. GENEL BAKIŞ
+================================================================================
+
+Bu analiz, elektrik dağıtım şebekenizdeki ekipmanların arıza olasılıklarını
+(Probability of Failure - PoF) tahmin ederek bakım planlamasına destek sağlar.
+
+Toplam Ekipman: 6,372
+Arıza Geçmişi Olan: 2,981 (%46.8)
+Analiz Edilen Arıza: 8,939
+
+İki ana metodoloji kullanılmaktadır:
+  A) Sağkalım Modelleri (Cox PH, RSF) - Zaman tabanlı arıza tahminleri
+  B) Makine Öğrenmesi (XGBoost, CatBoost) - Pattern tabanlı arıza tahminleri
+
+================================================================================
+2. ÇIKTI DOSYALARI
+================================================================================
+
+2.1 SAĞKALIM MODELİ SONUÇLARI (Cox Proportional Hazards)
+---------------------------------------------------------
+📊 cox_sagkalim_3ay_ariza_olasiligi.csv
+   Sonraki 3 ay içinde ekipmanların arıza yapma olasılığı
+   Model Performansı: Concordance Index = 0.859 (Mükemmel)
+
+📊 cox_sagkalim_6ay_ariza_olasiligi.csv
+   Sonraki 6 ay içinde ekipmanların arıza yapma olasılığı
+
+📊 cox_sagkalim_12ay_ariza_olasiligi.csv
+   Sonraki 12 ay içinde ekipmanların arıza yapma olasılığı
+
+   Örnek Değerler:
+   - Ortalama PoF (3 ay):  %0.2
+   - Ortalama PoF (6 ay):  %0.5
+   - Ortalama PoF (12 ay): %1.3
+   - Maksimum PoF (12 ay): %29.3
+
+📊 rsf_sagkalim_3ay_ariza_olasiligi.csv
+📊 rsf_sagkalim_6ay_ariza_olasiligi.csv
+📊 rsf_sagkalim_12ay_ariza_olasiligi.csv
+   Random Survival Forest modeli ile alternatif tahminler
+
+
+2.2 MAKİNE ÖĞRENMESİ MODELİ SONUÇLARI (Leakage-Free)
+----------------------------------------------------
+📊 leakage_free_ml_pof.csv
+   Makine öğrenmesi tabanlı 1 yıllık arıza tahminleri
+
+   Model Performansları:
+   - XGBoost AUC:  0.915 (Mükemmel)
+   - CatBoost AUC: 0.928 (Mükemmel)
+
+   Kolonlar:
+   - cbs_id: Ekipman kimliği
+   - PoF_ML_XGB: XGBoost model skoru (0-1 arası)
+   - PoF_ML_CatBoost: CatBoost model skoru (0-1 arası)
+
+   Önerilen Kullanım: İki skorun ortalamasını alın
+   Risk Kategorileri:
+   - Yüksek Risk: PoF > 0.15 (%15+)
+   - Orta Risk:   PoF > 0.05 (%5-15)
+   - Düşük Risk:  PoF ≤ 0.05 (%0-5)
+
+
+2.3 KRONİK EKIPMAN ANALİZİ (Çok Seviyeli Sistem)
+------------------------------------------------
+📊 chronic_equipment_summary.csv
+   Tüm ekipmanların kronik arıza durum özeti
+
+📊 chronic_equipment_only.csv
+   Sadece kronik olarak sınıflandırılmış ekipmanlar
+
+   Kronik Seviye Tanımları:
+
+   🔴 KRITIK (421 ekipman, %6.6)
+      └─ 3+ arıza 90 günde
+      └─ Aksiyon: ACİL MÜDAHALE GEREKLİ
+      └─ Ekipman derhal değiştirilmeli veya büyük onarım yapılmalı
+
+   🟠 YUKSEK (95 ekipman, %1.5)
+      └─ 4+ arıza 12 ayda
+      └─ Aksiyon: ÖNCELİKLİ BAKIM PLANLA
+      └─ 3 ay içinde müdahale edilmeli
+
+   🟡 ORTA (210 ekipman, %3.3)
+      └─ 3+ arıza 12 ayda (IEEE 1366 standardı)
+      └─ Aksiyon: TAKİP ET
+      └─ 6 ay içinde bakım planına al
+
+   🔵 GOZLEM (424 ekipman, %6.7)
+      └─ 2+ arıza 6 ayda
+      └─ Aksiyon: İZLE
+      └─ Durum izlenmeli, tekrar ederse müdahale et
+
+   ⚪ NORMAL (5,222 ekipman, %82.0)
+      └─ Kronik arıza yok
+      └─ Aksiyon: Rutin bakım
+
+
+2.4 EKİPMAN LİSTELERİ
+---------------------
+📊 ekipman_listesi.csv
+   Tüm ekipman master listesi (6,372 ekipman)
+
+📊 saglam_ekipman_listesi.csv
+   Hiç arıza yapmamış ekipmanlar (3,391 ekipman)
+
+
+2.5 ARIZA KAYITLARI
+-------------------
+📊 ariza_kayitlari.csv
+   Temizlenmiş arıza kayıtları (8,939 arıza)
+
+📊 sagkalim_taban.csv
+   Sağkalım analizi için hazırlanmış veri
+
+
+================================================================================
+3. DOSYA YAPISI VE KOLONLAR
+================================================================================
+
+3.1 Sağkalım Model Dosyaları (cox_sagkalim_*ay_ariza_olasiligi.csv)
+   Kolonlar:
+   - cbs_id:         Ekipman kimlik numarası
+   - PoF_Cox_3Ay:    Cox modeli 3 aylık arıza olasılığı (0-1)
+   - PoF_Cox_6Ay:    Cox modeli 6 aylık arıza olasılığı (0-1)
+   - PoF_Cox_12Ay:   Cox modeli 12 aylık arıza olasılığı (0-1)
+
+
+3.2 Kronik Ekipman Dosyası (chronic_equipment_summary.csv)
+   Kolonlar:
+   - cbs_id:                  Ekipman kimliği
+   - Ekipman_Tipi:            Ekipman tipi (Trafo, Sigorta, vb.)
+   - Toplam_Ariza_Sayisi:     Toplam arıza sayısı
+   - Son12Ay_Ariza_Sayisi:    Son 12 aydaki arıza sayısı
+   - Lambda_ArizaYillik:      Yıllık arıza oranı (λ)
+   - Kronik_IEEE_Flag:        IEEE 1366 kronik flag (1=kronik)
+   - Kronik_90G_Flag:         90 günlük kronik flag (1=kronik)
+   - Kronik_Birlesik_Flag:    Birleşik kronik flag (1=kronik)
+   - Kronik_Kritik:           Kritik seviye flag (1=kritik)
+   - Kronik_Yuksek:           Yüksek seviye flag (1=yüksek)
+   - Kronik_Orta:             Orta seviye flag (1=orta)
+   - Kronik_Gozlem:           Gözlem listesi flag (1=gözlem)
+   - Kronik_Seviye_Max:       En yüksek kronik seviyesi
+   - Ilk_Ariza_Tarihi:        İlk arıza tarihi
+   - Son_Ariza_Tarihi:        Son arıza tarihi
+   - Kurulum_Tarihi:          Ekipman kurulum tarihi
+   - Gozlem_Suresi_Yil:       Gözlem süresi (yıl)
+
+
+================================================================================
+4. KULLANIM ÖNERİLERİ
+================================================================================
+
+4.1 Acil Müdahale Listesi (Önümüzdeki 3 Ay)
+--------------------------------------------
+1. chronic_equipment_only.csv'den Kronik_Seviye_Max = "KRITIK" olanları filtrele
+2. cox_sagkalim_3ay_ariza_olasiligi.csv'den PoF_Cox_3Ay > 0.02 olanları filtrele
+3. Her iki listede de olan ekipmanları önceliklendir
+4. Bu ekipmanlara acil müdahale planla
+
+
+4.2 Öncelikli Bakım Planı (Önümüzdeki 6 Ay)
+-------------------------------------------
+1. Kronik_Seviye_Max = "YUKSEK" veya "KRITIK" ekipmanları seç
+2. cox_sagkalim_6ay_ariza_olasiligi.csv'den PoF_Cox_6Ay > 0.03 olanları ekle
+3. leakage_free_ml_pof.csv'den ortalama PoF > 0.10 olanları ekle
+4. Bakım ekiplerini bu ekipmanlara yönlendir
+
+
+4.3 Yıllık Bakım Stratejisi
+---------------------------
+1. cox_sagkalim_12ay_ariza_olasiligi.csv'yi baz al
+2. En yüksek PoF'lu %10'luk dilimi seç (yaklaşık 637 ekipman)
+3. Ekipman tipine göre grupla:
+   - Trafo: Öncelik 1 (kesinti maliyeti yüksek)
+   - Sigorta: Öncelik 2 (hızlı değiştirilebilir)
+   - Hat: Öncelik 3 (lokasyon bazlı planlama)
+
+
+4.4 Bütçe Planlaması
+-------------------
+Kronik Seviyelere Göre Tahmini Bütçe Dağılımı:
+- KRITIK ekipmanlar:  %40 bütçe (421 ekipman)
+- YUKSEK ekipmanlar:  %30 bütçe (95 ekipman)
+- ORTA ekipmanlar:    %20 bütçe (210 ekipman)
+- GOZLEM listesi:     %10 bütçe (424 ekipman)
+
+
+================================================================================
+5. MODEL GÜVENİLİRLİĞİ
+================================================================================
+
+5.1 Cox Proportional Hazards Modeli
+   ✅ Concordance Index: 0.859
+      → Model, %85.9 oranında doğru sıralamayla ekipmanları risklendirir
+      → 0.7-0.8: İyi, >0.8: Mükemmel kabul edilir
+
+   ✅ Veri Leakage: Yok
+      → Model, gelecek bilgisi kullanmadan eğitilmiştir
+
+   ✅ Kullanılan Özellikler:
+      - Ekipman yaşı
+      - MTBF (Arızalar arası ortalama süre)
+      - Arıza sayısı
+      - Kronik flag
+      - Son arızadan geçen süre
+      - Bakım geçmişi
+      - Ekipman tipi
+
+
+5.2 Makine Öğrenmesi Modelleri (XGBoost + CatBoost)
+   ✅ XGBoost AUC: 0.915
+   ✅ CatBoost AUC: 0.928
+      → 0.8-0.9: Çok iyi, >0.9: Mükemmel kabul edilir
+
+   ✅ Leakage-Free Eğitim:
+      - Referans Tarih: 2024-12-10
+      - Geçmiş Veri: 7,900 arıza (sadece ref. tarihinden önce)
+      - Tahmin Penceresi: 2024-12-10 → 2025-12-10
+      - Gerçek Arıza: 1,039 (pencere içi)
+      - Model Tahmini: 645 ekipman risk altında (%10.3)
+
+   ✅ Cross-validation ile doğrulanmıştır
+
+
+5.3 Model Kısıtlamaları
+   ⚠️ kVA_Rating verisi eksik → Trafo kapasitesi modelde kullanılamamış
+   ⚠️ Hava durumu verisi yok → Mevsimsel etkiler sınırlı
+   ⚠️ Topraklama direnci yok → Elektriksel kalite faktörleri eksik
+
+
+================================================================================
+6. TEKNİK DESTEK VE SORULAR
+================================================================================
+
+Model Performansı Hakkında:
+- Concordance Index nedir? → Modelin sıralama doğruluğu
+- AUC nedir? → Model ayırt etme gücü (0.5=rastgele, 1.0=mükemmel)
+- AP (Average Precision) nedir? → Pozitif sınıf tahmin başarısı
+
+Kullanım Hakkında:
+- Hangi model kullanılmalı? → Cox modeli zamansal, ML modeli pattern için
+- Eşik değeri ne olmalı? → İşletme riskine ve kapasiteye göre ayarlanmalı
+- Ne sıklıkla güncellenmeli? → 3 ayda bir yeniden eğitim önerilir
+
+Veri Kalitesi:
+- Eksik veriler nasıl ele alındı? → Median imputation kullanıldı
+- Outlier'lar temizlendi mi? → Evet, %99 percentile kırpıldı
+- Data leakage kontrolü yapıldı mı? → Evet, temporal split ile doğrulandı
+
+
+================================================================================
+7. SONUÇ VE ÖNERİLER
+================================================================================
+
+✅ Başarılar:
+   - Yüksek model performansı elde edildi (AUC > 0.90)
+   - Çok seviyeli kronik tespit sistemi kuruldu
+   - Türkçe müşteri dostu çıktılar hazırlandı
+   - Veri sızıntısı (leakage) sorunu çözüldü
+
+⚠️ İyileştirme Alanları:
+   1. kVA_Rating verisi tamamlanmalı
+   2. Meteoroloji verisi entegre edilmeli
+   3. Yer bilgisi (lokasyon) analize dahil edilmeli
+   4. Korozyon/yaş kalite verisi eklenmeli
+
+🎯 Aksiyon Planı:
+   1. KRİTİK ekipmanlara 1 ay içinde müdahale
+   2. YUKSEK ekipmanlara 3 ay içinde müdahale
+   3. ORTA ekipmanlara 6 ay içinde müdahale
+   4. GOZLEM listesi aylık takip edilsin
+
+📊 Raporlama:
+   - Aylık: KRITIK ekipman durumu
+   - Üç aylık: Model performans değerlendirmesi
+   - Yıllık: Stratejik bakım planı güncellemesi
+
+
+================================================================================
+Son Güncelleme: 2025-12-10
+Model Versiyonu: PoF3-v3.0-MultiLevel
+Hazırlayan: PoF3 Analitik Sistemi
+================================================================================

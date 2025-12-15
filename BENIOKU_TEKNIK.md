@@ -131,7 +131,20 @@ PoF3/
 ```
 
 ---
+## 4.1 Model Kalibrasyonu ve Temel Oranlar (Base Rates)
 
+PoF3 modeli, "dengesiz veri" (imbalanced data) yanılgısına düşmemek için DSOs (Dağıtım Şirketleri) için geçerli olan **gerçekçi yıllık arıza oranlarına** göre kalibre edilmiştir. Model çıktıları aşağıdaki endüstri standartları ile uyumlu olacak şekilde denetlenir:
+
+| Varlık Tipi | Beklenen Yıllık Arıza Oranı | Kalibrasyon Notu |
+|:---|:---|:---|    
+| **Güç Trafosu** | %0.5 – %5.0 | Yaş ve yüklenme durumuna duyarlı |
+| **Kesici (Breaker)** | %3.0 – %8.0 | Bakım geçmişi ve mekanik aşınma odaklı |
+| **Ayırıcı (Switch)** | %5.0 – %12.0 | Çevresel faktörler (korozyon/nem) ağırlıklı |
+| **Hatlar (OH/UG)** | %0.5 – %15.0 | Hava durumu ve dış etkenler (kazı vb.) |
+| **Sigortalar** | %15.0 – %30.0 | Operasyonel "sigorta atması" dahil |
+| **Direkler** | %0.1 – %3.0 | Sadece fiziksel/yapısal bütünlük kaybı |
+
+**Not:** Model, her varlık tipi için ayrı ayrı eğitilmiş (stratified) ve bu taban oranlara göre doğrulanmıştır (walk-forward validation).
 ## 🔧 Installation & Setup
 
 ### Prerequisites

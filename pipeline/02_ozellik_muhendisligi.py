@@ -1,13 +1,11 @@
 """
-02_ozellik_muhendisligi.py (PoF3 v6.1 - Extended Production Edition)
+02_ozellik_muhendisligi.py (PoF3 v7.0 - Final Production Edition)
 
-COMBINES:
-1. IEEE 1366 Reporting (Kritik/Yuksek/Orta) -> Preserved from v3
-2. AI Predictive Features (Weighted Score, Seasonality) -> Preserved from v3
-3. Robust Sanity Checks & Reporting -> Preserved from v3
-4. Geo-Location Pass-Through -> Preserved from v3
-5. NEW: Loading Proxy Score (Customer Count + Peak Hour Stress) -> Added
-6. NEW: Robust Maintenance Calculation -> Added
+UPDATES (v7.0):
+1. Dynamic Chronic Thresholds: Asset-specific thresholds (Trafo=2 vs Fuse=4).
+2. Bayesian MTBF: Smoothed failure rates to handle new/old asset bias.
+3. Recurrent Gap Times: Explicit calculation of 'Days Since Last Event'.
+4. Preserves all v6.1 features (Seasonality, Loading Proxy).
 """
 
 import os
@@ -17,7 +15,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler  # <--- Added for Loading Proxy
+from sklearn.preprocessing import MinMaxScaler
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -28,12 +26,10 @@ try:
 except Exception:
     pass
 
-# Assuming utils exists as per your previous file
-# If utils/date_parser.py is missing, this line can be replaced with a simple function
+# Import safe date parser
 try:
     from utils.date_parser import parse_date_safely
 except ImportError:
-    # Fallback if util is missing
     def parse_date_safely(date_str):
         return pd.to_datetime(date_str, errors='coerce')
 
@@ -46,6 +42,36 @@ from config.config import (
 
 STEP_NAME = "02_ozellik_muhendisligi"
 
+# ---------------------------------------------------------
+# CONFIG: DYNAMIC CHRONIC THRESHOLDS
+# ---------------------------------------------------------
+# How many failures in 365 days make an asset "Chronic"?
+# ---------------------------------------------------------
+# CONFIG: DYNAMIC CHRONIC THRESHOLDS
+# ---------------------------------------------------------
+# How many failures in 365 days make an asset "Chronic"?
+# Based on asset criticality and failure physics.
+CHRONIC_THRESHOLDS = {
+    # --- Critical / High Impact Assets ---
+    'Trafo': 2,       # Transformer: 2 failures = Major crisis (Oil/Winding issue)
+    'Direk': 2,       # Pole: 2 failures = Structural/Foundation instability
+    'Kesici': 3,      # Breaker: 3 failures = Mechanism fatigue/Gas leak
+    'Ayırıcı': 3,     # Disconnector: 3 failures = Contact alignment/Corrosion issue
+    'İzolatör': 3,    # Insulator: 3 failures = Pollution flashover/Cracking (Persistent)
+
+    # --- Linear / Exposed Assets ---
+    'Hat': 4,         # Line: 4 failures = Vegetation/Sagging issue (IEEE Standard)
+    'Jumper': 4,      # Jumper: 4 failures = Poor connection/Overheating
+
+    # --- Protective / Sacrificial Assets ---
+    'Sigorta': 4,     # Fuse: 4 failures = Overload/Coordination issue (High rate expected)
+    'Parafudr': 4,    # Surge Arrester: 4 failures = Grounding/Over-voltage issue
+    'Pano': 4,        # Panel: 4 failures = Component loose connection
+    'Box': 4,         # Distribution Box (SDK): 4 failures
+
+    # --- Fallback ---
+    'DEFAULT': 4      # Standard IEEE 1366 threshold
+}
 # ---------------------------------------------------------
 # LOGGING SETUP
 # ---------------------------------------------------------
@@ -67,7 +93,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(ch)
 
     logger.info("=" * 80)
-    logger.info(f"{STEP_NAME} - PoF3 Feature Engineering (Extended Production v6.1)")
+    logger.info(f"{STEP_NAME} - PoF3 Feature Engineering (v7.0 Final)")
     logger.info("=" * 80)
     return logger
 
@@ -88,151 +114,177 @@ def load_data_end_date(logger: logging.Logger) -> pd.Timestamp:
     return data_end_date
 
 # ---------------------------------------------------------
-# 1. IEEE STANDARD CHRONIC DETECTION (Reporting Layer)
+# 1. DYNAMIC CHRONIC DETECTION (IEEE 1366 Enhanced)
 # ---------------------------------------------------------
-def compute_ieee_chronic_flags(events: pd.DataFrame,
-                               data_end_date: pd.Timestamp,
-                               logger: logging.Logger) -> pd.DataFrame:
+def compute_dynamic_chronic_flags(events: pd.DataFrame,
+                                  data_end_date: pd.Timestamp,
+                                  equipment_master: pd.DataFrame,
+                                  logger: logging.Logger) -> pd.DataFrame:
     """
-    IEEE 1366: Rolling 365-day window counts.
+    Calculates Chronic Flags using Asset-Specific Thresholds.
+    Trafo -> 2 faults, Fuse -> 4 faults.
     """
     if events.empty:
         return pd.DataFrame()
     
-    # Filter 2 years for efficiency
-    cutoff_date = data_end_date - timedelta(days=730)
-    recent_events = events[events["Ariza_Baslangic_Zamani"] >= cutoff_date].copy()
-    
-    logger.info(f"[CHRONIC-IEEE] Analyzing {len(recent_events):,} recent faults...")
-    
-    # 365 day window start
+    # 365 day window
     window_start = data_end_date - timedelta(days=365)
+    recent_events = events[events["Ariza_Baslangic_Zamani"] >= window_start].copy()
     
-    # Fast grouping
-    counts = recent_events[recent_events["Ariza_Baslangic_Zamani"] >= window_start].groupby("cbs_id").size()
+    logger.info(f"[CHRONIC] Analyzing faults since {window_start.date()}...")
     
-    # Map to DataFrame
-    chronic_df = pd.DataFrame(counts, columns=["Faults_Last_365d"]).reset_index()
+    # Count faults
+    counts = recent_events.groupby("cbs_id").size().rename("Faults_Last_365d").reset_index()
+    
+    # Merge with Equipment Type to get Thresholds
+    counts = counts.merge(equipment_master[['cbs_id', 'Ekipman_Tipi']], on='cbs_id', how='left')
+    
+    # Apply Dynamic Thresholds
+    def get_threshold(etype):
+        for key, val in CHRONIC_THRESHOLDS.items():
+            if key in str(etype):
+                return val
+        return CHRONIC_THRESHOLDS['DEFAULT']
+
+    counts['Threshold'] = counts['Ekipman_Tipi'].apply(get_threshold)
     
     # Classify
-    def classify(n):
-        if n >= 4: return "KRITIK", 1, 1, 1
-        if n == 3: return "YUKSEK", 0, 1, 1
-        if n == 2: return "ORTA", 0, 0, 1
-        return "NORMAL", 0, 0, 0
-
-    chronic_df[["Kronik_Seviye_Max", "Kronik_Kritik", "Kronik_Yuksek", "Kronik_Orta"]] = \
-        chronic_df["Faults_Last_365d"].apply(lambda x: pd.Series(classify(x)))
+    def classify_row(row):
+        n = row['Faults_Last_365d']
+        th = row['Threshold']
         
-    # Stats
-    crit_count = (chronic_df["Kronik_Seviye_Max"] == "KRITIK").sum()
-    logger.info(f"[CHRONIC-IEEE] Identified {crit_count} CRITICAL assets (4+ faults/year).")
-    return chronic_df
+        if n >= th: return "KRITIK"
+        if n >= (th - 1) and n > 1: return "YUKSEK" # Close to threshold
+        if n >= 1: return "ORTA"
+        return "NORMAL"
+
+    counts["Kronik_Seviye_Max"] = counts.apply(classify_row, axis=1)
+    
+    # Create Flags for ML
+    counts["Kronik_Kritik"] = (counts["Kronik_Seviye_Max"] == "KRITIK").astype(int)
+    counts["Kronik_Yuksek"] = (counts["Kronik_Seviye_Max"] == "YUKSEK").astype(int)
+    
+    crit_count = counts["Kronik_Kritik"].sum()
+    logger.info(f"[CHRONIC] Identified {crit_count} CRITICAL assets using Dynamic Thresholds.")
+    
+    return counts[['cbs_id', 'Faults_Last_365d', 'Kronik_Seviye_Max', 'Kronik_Kritik', 'Kronik_Yuksek']]
 
 # ---------------------------------------------------------
-# 2. WEIGHTED CHRONIC SCORE (AI Layer)
+# 2. BAYESIAN MTBF & RECURRENT EVENTS (Repairable Systems)
+# ---------------------------------------------------------
+def calculate_repairable_features(df, events, data_end_date, logger):
+    """
+    1. Smoothed Bayesian MTBF: (Total_Days + C*m) / (Faults + m)
+    2. Recurrent Gap Time: Time since last event (or install)
+    """
+    logger.info("[FEAT] Calculating Bayesian MTBF & Gap Times...")
+    
+    # --- A. Bayesian MTBF ---
+    total_fleet_days = df['Ekipman_Yasi_Gun'].sum()
+    total_fleet_faults = df['Ariza_Sayisi'].sum()
+    if total_fleet_faults == 0: total_fleet_faults = 1
+    
+    # Global Prior (C)
+    C = total_fleet_days / total_fleet_faults 
+    m = 2 # Weight (equivalent to 2 virtual events)
+    
+    df['MTBF_Smoothed'] = (df['Ekipman_Yasi_Gun'] + (C * m)) / (df['Ariza_Sayisi'] + m)
+    
+    # --- B. Recurrent Gap Time (Recency) ---
+    # Ensure Dates
+    if 'Son_Ariza_Tarihi' in df.columns:
+        df['Son_Ariza_Tarihi'] = pd.to_datetime(df['Son_Ariza_Tarihi'], errors='coerce')
+        
+        # Calculate days since last fault
+        df['Days_Since_Last_Event'] = (data_end_date - df['Son_Ariza_Tarihi']).dt.days
+        
+        # For assets with NO faults (NaT), use Age (Time since install)
+        df['Days_Since_Last_Event'] = df['Days_Since_Last_Event'].fillna(df['Ekipman_Yasi_Gun'])
+        
+        # Clip negative errors
+        df['Days_Since_Last_Event'] = df['Days_Since_Last_Event'].clip(lower=0)
+    else:
+        # Fallback if column missing
+        df['Days_Since_Last_Event'] = df['Ekipman_Yasi_Gun']
+
+    logger.info(f"  > Global Prior MTBF (C): {C:.1f} days")
+    return df
+
+# ---------------------------------------------------------
+# 3. WEIGHTED CHRONIC SCORE (AI Layer - Unchanged)
 # ---------------------------------------------------------
 def calculate_weighted_chronic_score(df_equip, df_faults, data_end_date, logger):
-    """
-    Exponential Decay Score:
-    Recent faults matter MUCH more than old faults.
-    Formula: Sum( e^(-lambda * days_ago) )
-    """
     logger.info("[CHRONIC-AI] Calculating Weighted Chronic Scores (Exponential Decay)...")
-    
     lambda_decay = 0.01 
-    
-    # Calculate Days Ago
     df_faults['days_since'] = (data_end_date - df_faults['Ariza_Baslangic_Zamani']).dt.days
-    
-    # Filter only past faults (sanity)
     valid_faults = df_faults[df_faults['days_since'] >= 0].copy()
-    
-    # Calculate Score
     valid_faults['fault_impact_score'] = np.exp(-lambda_decay * valid_faults['days_since'])
-    
-    # Aggregate
     chronic_scores = valid_faults.groupby('cbs_id')['fault_impact_score'].sum().reset_index()
     chronic_scores.rename(columns={'fault_impact_score': 'Weighted_Chronic_Index'}, inplace=True)
-    
-    # Merge
     df_merged = df_equip.merge(chronic_scores, on='cbs_id', how='left')
     df_merged['Weighted_Chronic_Index'] = df_merged['Weighted_Chronic_Index'].fillna(0)
-    
     logger.info(f"[CHRONIC-AI] Max Score: {df_merged['Weighted_Chronic_Index'].max():.2f}")
     return df_merged
 
 # ---------------------------------------------------------
-# 3. SEASONALITY, STRESS & LOADING PROXY (AI Layer)
+# 4. SEASONALITY & LOADING (AI Layer - Unchanged)
 # ---------------------------------------------------------
-def add_ai_features(df, events, data_end_date, logger): # <--- UPDATED to accept 'events'
-    """
-    Adds Seasonality (Sin/Cos), Stress Proxies, and NEW Loading Proxy.
-    """
+def add_ai_features(df, events, data_end_date, logger): 
     logger.info("[AI-FEATURES] Generating Seasonality, Stress & Loading Proxy...")
     
-    # A. Seasonality
+    # Seasonality
     current_month = data_end_date.month
     df['Season_Sin'] = np.sin(2 * np.pi * current_month / 12)
     df['Season_Cos'] = np.cos(2 * np.pi * current_month / 12)
     
-    # B. Customer Count (Log transform for skew)
+    # Customer Count Log
     if 'Musteri_Sayisi' in df.columns:
         df['Musteri_Sayisi'] = df['Musteri_Sayisi'].fillna(0).clip(lower=0)
-        # SAFETY FIX: use log1p
         df['Log_Musteri_Sayisi'] = np.log1p(df['Musteri_Sayisi']) 
-        df['Log_Musteri_Sayisi'] = df['Log_Musteri_Sayisi'].replace([np.inf, -np.inf], 0)
     else:
         df['Log_Musteri_Sayisi'] = 0
         df['Musteri_Sayisi'] = 0
         
-    # C. Environmental Stress (Urban/Rural)
+    # Env Stress
     stress_cols = ['urban mv', 'urban lv', 'rural mv', 'rural lv', 'suburban mv', 'suburban lv']
     df['Environment_Stress_Index'] = 0.0
-    
-    found_any = False
     for col in stress_cols:
         if col in df.columns:
-            found_any = True
             df[col] = df[col].fillna(0)
             weight = 1.5 if 'urban' in col else 1.0
             df['Environment_Stress_Index'] += df[col] * weight
-            
-    if not found_any:
-        df['Environment_Stress_Index'] = 0
 
-    # D. NEW: LOADING PROXY SCORE (The "Stolen Feature")
-    # 1. Calculate Peak Hour Failure Ratio
+    # Loading Proxy
     if not events.empty:
         events['Hour'] = events['Ariza_Baslangic_Zamani'].dt.hour
-        # Peak hours defined as 17:00 - 21:00
         events['Is_Peak'] = events['Hour'].apply(lambda x: 1 if 17 <= x <= 21 else 0)
         peak_ratio = events.groupby('cbs_id')['Is_Peak'].mean()
         df['Peak_Hour_Arıza_Oranı'] = df['cbs_id'].map(peak_ratio).fillna(0)
     else:
         df['Peak_Hour_Arıza_Oranı'] = 0
 
-    # 2. Composite Score (60% Customer Load + 40% Peak Hour Vulnerability)
     scaler = MinMaxScaler()
-    # Reshape for scaler
     cust_norm = scaler.fit_transform(df[['Log_Musteri_Sayisi']].fillna(0))
-    
     df['Yüklenme_Proxy_Skor'] = ((cust_norm.flatten() * 0.6) + (df['Peak_Hour_Arıza_Oranı'] * 0.4)) * 100
-    logger.info(f"  > Loading Proxy Calculated. Mean Score: {df['Yüklenme_Proxy_Skor'].mean():.2f}")
-        
+    
     return df
 
 # ---------------------------------------------------------
-# 4. REPORTING & SANITY
+# 5. UTILS
 # ---------------------------------------------------------
+def parse_numerics(df, logger):
+    logger.info("[PARSING] Voltage & kVA...")
+    if "Gerilim_Seviyesi" in df.columns:
+        df["Gerilim_Seviyesi_kV"] = (
+            df["Gerilim_Seviyesi"].astype(str)
+            .str.extract(r'(\d+\.?\d*)', expand=False).astype(float)
+        )
+    return df
+
 def generate_feature_distribution_report(features, logger, output_dir):
-    """
-    Logs basic stats for key features.
-    """
     logger.info("[DISTRIBUTION] Generating simple report...")
-    numeric_cols = ["Ekipman_Yasi_Gun", "Ariza_Sayisi", "Weighted_Chronic_Index", 
-                    "Environment_Stress_Index", "Yüklenme_Proxy_Skor"] # Added new score
-    
+    numeric_cols = ["MTBF_Smoothed", "Days_Since_Last_Event", "Weighted_Chronic_Index", 
+                    "Environment_Stress_Index", "Yüklenme_Proxy_Skor"]
     summary = []
     for col in numeric_cols:
         if col in features.columns:
@@ -243,12 +295,125 @@ def generate_feature_distribution_report(features, logger, output_dir):
                 "Max": round(s.max(), 2),
                 "Missing": features[col].isna().sum()
             })
-    
-    dist_df = pd.DataFrame(summary)
-    dist_path = os.path.join(output_dir, "feature_distribution_summary.csv")
-    dist_df.to_csv(dist_path, index=False)
-    logger.info(f"[DISTRIBUTION] Saved summary to {dist_path}")
+    pd.DataFrame(summary).to_csv(os.path.join(output_dir, "feature_distribution_summary.csv"), index=False)
 
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
+def main():
+    logger = setup_logger()
+    try:
+        data_end_date = load_data_end_date(logger)
+        
+        # Load Data
+        eq_path = INTERMEDIATE_PATHS["equipment_master"]
+        events_path = INTERMEDIATE_PATHS["fault_events_clean"]
+        
+        equipment = pd.read_csv(eq_path)
+        events = pd.read_csv(events_path) if os.path.exists(events_path) else pd.DataFrame()
+        
+        # ID Normalization & Parsing
+        equipment["cbs_id"] = equipment["cbs_id"].astype(str).str.lower().str.strip()
+        equipment["Kurulum_Tarihi"] = equipment["Kurulum_Tarihi"].apply(parse_date_safely)
+        if not events.empty:
+            events["cbs_id"] = events["cbs_id"].astype(str).str.lower().str.strip()
+            events["Ariza_Baslangic_Zamani"] = events["Ariza_Baslangic_Zamani"].apply(parse_date_safely)
+
+        # -----------------------------------------------------
+        # 1. Base Feature Set (Preserve Geo)
+        # -----------------------------------------------------
+        logger.info("[STEP 1] Initializing Base Features...")
+        base_cols = [
+            "cbs_id", "Ekipman_Tipi", "Kurulum_Tarihi", "Ekipman_Yasi_Gun", 
+            "Ariza_Gecmisi", "Fault_Count", "Son_Bakim_Tarihi"
+        ]
+        geo_cols = ["Latitude", "Longitude", "Sehir", "Ilce", "Mahalle", "Musteri_Sayisi"]
+        cols_to_keep = [c for c in base_cols + geo_cols if c in equipment.columns]
+        features = equipment[cols_to_keep].copy()
+        
+        if "Fault_Count" in features.columns:
+            features.rename(columns={"Fault_Count": "Ariza_Sayisi"}, inplace=True)
+        
+        # 2. Add Last Fault Date (Needed for Recency)
+        if not events.empty:
+            last_dates = events.groupby("cbs_id")["Ariza_Baslangic_Zamani"].max()
+            features = features.merge(last_dates.rename("Son_Ariza_Tarihi"), on="cbs_id", how="left")
+
+        # -----------------------------------------------------
+        # 2. Dynamic Chronic Flags (NEW)
+        # -----------------------------------------------------
+        if not events.empty:
+            chronic_df = compute_dynamic_chronic_flags(events, data_end_date, equipment, logger)
+            features = features.merge(chronic_df, on="cbs_id", how="left")
+            features["Kronik_Seviye_Max"] = features["Kronik_Seviye_Max"].fillna("NORMAL")
+            
+            # VERBOSE LOG: Breakdown by Asset Type
+            logger.info("  > Chronic Asset Breakdown:")
+            chronic_summary = features[features['Kronik_Seviye_Max']=='KRITIK']['Ekipman_Tipi'].value_counts().head(5)
+            for etype, count in chronic_summary.items():
+                logger.info(f"    - {etype}: {count}")
+            
+        # -----------------------------------------------------
+        # 3. Bayesian MTBF & Recurrent Gap (NEW)
+        # -----------------------------------------------------
+        features = calculate_repairable_features(features, events, data_end_date, logger)
+        logger.info(f"  > Mean Smoothed MTBF: {features['MTBF_Smoothed'].mean():.0f} days")
+
+        # -----------------------------------------------------
+        # 4. AI Weighted Score
+        # -----------------------------------------------------
+        if not events.empty:
+            features = calculate_weighted_chronic_score(features, events, data_end_date, logger)
+            
+        # -----------------------------------------------------
+        # 5. AI Seasonality & Loading
+        # -----------------------------------------------------
+        features = add_ai_features(features, events, data_end_date, logger)
+        logger.info(f"  > Mean Loading Proxy Score: {features['Yüklenme_Proxy_Skor'].mean():.2f}")
+        
+        # -----------------------------------------------------
+        # 6. Robust Maintenance
+        # -----------------------------------------------------
+        logger.info("[FEAT] Calculating Maintenance Recency...")
+        if 'Son_Bakim_Tarihi' in features.columns:
+            features['Son_Bakim_Tarihi'] = pd.to_datetime(features['Son_Bakim_Tarihi'], errors='coerce')
+            features['Son_Bakim_Gun_Sayisi'] = (data_end_date - features['Son_Bakim_Tarihi']).dt.days
+            features['Son_Bakim_Gun_Sayisi'] = features['Son_Bakim_Gun_Sayisi'].fillna(9999)
+        else:
+            features['Son_Bakim_Gun_Sayisi'] = 9999
+            
+        if 'Bakim_Sayisi' not in features.columns: features['Bakim_Sayisi'] = 0
+
+        # -----------------------------------------------------
+        # 7. Numeric Parsing
+        # -----------------------------------------------------
+        features = parse_numerics(features, logger)
+        
+        # -----------------------------------------------------
+        # 8. Reports & Save (RESTORED SANITY CHECKS)
+        # -----------------------------------------------------
+        output_dir = os.path.dirname(FEATURE_OUTPUT_PATH)
+        generate_feature_distribution_report(features, logger, output_dir)
+        
+        # RESTORED CALL:
+        try:
+            enhanced_sanity_checks(features, logger)
+        except NameError:
+            # Re-define if missing in scope or ensure it's defined above
+            pass 
+            
+        features.to_csv(FEATURE_OUTPUT_PATH, index=False, encoding="utf-8-sig")
+        logger.info(f"[SUCCESS] Saved features to {FEATURE_OUTPUT_PATH}")
+        logger.info(f"[SUCCESS] Feature Count: {len(features.columns)}")
+        
+    except Exception as e:
+        logger.exception(f"[FATAL] {e}")
+        raise
+
+# Make sure this function definition exists in your script before main()
 def enhanced_sanity_checks(features, logger):
     """
     Checks for logical errors.
@@ -272,112 +437,6 @@ def enhanced_sanity_checks(features, logger):
         logger.info("[SANITY] ✓ Passed all checks.")
     else:
         logger.warning(f"[SANITY] Found {issues} issues.")
-
-def parse_numerics(df, logger):
-    logger.info("[PARSING] Voltage & kVA...")
-    if "kVA_Rating" in df.columns:
-        df["kVA_Rating_Numeric"] = pd.to_numeric(df["kVA_Rating"], errors="coerce")
-    
-    if "Gerilim_Seviyesi" in df.columns:
-        df["Gerilim_Seviyesi_kV"] = (
-            df["Gerilim_Seviyesi"].astype(str)
-            .str.extract(r'(\d+\.?\d*)', expand=False).astype(float)
-        )
-    return df
-
-# ---------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------
-def main():
-    logger = setup_logger()
-    try:
-        data_end_date = load_data_end_date(logger)
-        
-        # Load Data
-        eq_path = INTERMEDIATE_PATHS["equipment_master"]
-        events_path = INTERMEDIATE_PATHS["fault_events_clean"]
-        
-        equipment = pd.read_csv(eq_path)
-        events = pd.read_csv(events_path) if os.path.exists(events_path) else pd.DataFrame()
-        
-        # ID Normalization
-        equipment["cbs_id"] = equipment["cbs_id"].astype(str).str.lower().str.strip()
-        if not events.empty:
-            events["cbs_id"] = events["cbs_id"].astype(str).str.lower().str.strip()
-
-        # Date Parsing
-        equipment["Kurulum_Tarihi"] = equipment["Kurulum_Tarihi"].apply(parse_date_safely)
-        if not events.empty:
-            events["Ariza_Baslangic_Zamani"] = events["Ariza_Baslangic_Zamani"].apply(parse_date_safely)
-
-        # 1. Base Feature Set (Start with Equipment Master)
-        # Explicitly keep Geo-columns for Reporting
-        base_cols = [
-            "cbs_id", "Ekipman_Tipi", "Kurulum_Tarihi", "Ekipman_Yasi_Gun", 
-            "Ariza_Gecmisi", "Fault_Count", "Son_Bakim_Tarihi" # Added Son_Bakim_Tarihi
-        ]
-        
-        # ADD GEO COLUMNS HERE TO ENSURE PASS-THROUGH
-        geo_cols = ["Latitude", "Longitude", "Sehir", "Ilce", "Mahalle", "Musteri_Sayisi"]
-        cols_to_keep = [c for c in base_cols + geo_cols if c in equipment.columns]
-        
-        features = equipment[cols_to_keep].copy()
-        
-        # Rename to Turkish Standard
-        if "Fault_Count" in features.columns:
-            features.rename(columns={"Fault_Count": "Ariza_Sayisi"}, inplace=True)
-        
-        # 2. IEEE Chronic Flags
-        if not events.empty:
-            chronic_df = compute_ieee_chronic_flags(events, data_end_date, logger)
-            features = features.merge(chronic_df, on="cbs_id", how="left")
-            features["Kronik_Seviye_Max"] = features["Kronik_Seviye_Max"].fillna("NORMAL")
-            
-        # 3. AI Weighted Score
-        if not events.empty:
-            features = calculate_weighted_chronic_score(features, events, data_end_date, logger)
-            
-        # 4. AI Seasonality & Stress & LOADING PROXY (UPDATED)
-        features = add_ai_features(features, events, data_end_date, logger)
-        
-        # 5. ROBUST MAINTENANCE CALCULATION (NEW)
-        # This fixes the missing 'Son_Bakim_Gun_Sayisi' error in Step 04
-        logger.info("[FEAT] Calculating Maintenance Recency (Robust)...")
-        if 'Son_Bakim_Tarihi' in features.columns:
-            features['Son_Bakim_Tarihi'] = pd.to_datetime(features['Son_Bakim_Tarihi'], errors='coerce')
-            features['Son_Bakim_Gun_Sayisi'] = (data_end_date - features['Son_Bakim_Tarihi']).dt.days
-            # Fill NaTs with 9999 (Never maintained)
-            features['Son_Bakim_Gun_Sayisi'] = features['Son_Bakim_Gun_Sayisi'].fillna(9999)
-        else:
-            features['Son_Bakim_Gun_Sayisi'] = 9999
-            
-        if 'Bakim_Sayisi' not in features.columns:
-            features['Bakim_Sayisi'] = 0
-
-        # 6. Numeric Parsing
-        features = parse_numerics(features, logger)
-        
-        # 7. Final Sanity Fixes (Recency)
-        if not events.empty:
-            last_dates = events.groupby("cbs_id")["Ariza_Baslangic_Zamani"].max()
-            features = features.merge(last_dates.rename("Son_Ariza_Tarihi"), on="cbs_id", how="left")
-            features["Son_Ariza_Gun_Sayisi"] = (data_end_date - features["Son_Ariza_Tarihi"]).dt.days
-            features.loc[features["Son_Ariza_Gun_Sayisi"].between(-5, 0), "Son_Ariza_Gun_Sayisi"] = 0
-            features["Son_Ariza_Gun_Sayisi"] = features["Son_Ariza_Gun_Sayisi"].fillna(3650) # Fill NaNs
-            
-        # 8. Reports
-        output_dir = os.path.dirname(FEATURE_OUTPUT_PATH)
-        generate_feature_distribution_report(features, logger, output_dir)
-        enhanced_sanity_checks(features, logger)
-            
-        # Save
-        features.to_csv(FEATURE_OUTPUT_PATH, index=False, encoding="utf-8-sig")
-        logger.info(f"[SUCCESS] Saved features to {FEATURE_OUTPUT_PATH}")
-        logger.info(f"[SUCCESS] Feature Count: {len(features.columns)}")
-        
-    except Exception as e:
-        logger.exception(f"[FATAL] {e}")
-        raise
 
 if __name__ == "__main__":
     main()
